@@ -1,6 +1,5 @@
 import asyncio
 import os
-import random
 import signal
 import sys
 import json
@@ -86,7 +85,7 @@ async def mine():
             continue
         # you could pound this harder, but it's not enough to be first--
         # you also must slot the right block...
-        await asyncio.sleep(random.randint(5)) 
+        await asyncio.sleep(5) 
 
 def main():
     banner = """
