@@ -1,0 +1,27 @@
+;; Mineable puzzle that stores coins and allows them to be mined according
+;; to a schedule.
+;;
+;; Some requirements for this puzzle:
+;; 1. Coin has not been spent for at least 1 block -- but likely ~3 with only 1/3 on average being TX blocks
+;; 2. Height equals a specific user-provided height - no peeking ahead / stuffing mempool!
+;; 3. Creates reward to user address, rest back to puzzle hash
+
+(mod 
+   (
+      my_amount         ; Amount held in this coin
+      user_height       ; Height attempting to mine at
+      target_address    ; Address to mine to
+   )  
+
+  (include condition_codes.clib)
+  ;;;(include curry.clib)
+
+  (list
+    (list ASSERT_MY_AMOUNT my_amount)
+    (list ASSERT_HEIGHT_RELATIVE 1)
+    ;;;(list ASSERT_HEIGHT_ABSOLUTE user_height)
+    ;;;(list ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 1))
+    (list CREATE_COIN target_address my_amount (list target_address))
+    ;;;(list CREATE_COIN PUZZLE_HASH (- my_amount 1) (PUZZLE_HASH))
+  )
+)

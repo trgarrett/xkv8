@@ -1,0 +1,5 @@
+chia_wallet_sdk
+pytest-asyncio>=0.21.0
+# Optional: add pytest and anyio if not already present
+pytest>=7.0
+anyio>=3.0
