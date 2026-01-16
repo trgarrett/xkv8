@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import signal
 import sys
 import json
@@ -17,7 +18,7 @@ TAIL_HASH = bytes.fromhex("4eadfa450c19fa51df65eb7fbf5b61077ec80ec799a7652bb187b
 TARGET_ADDRESS = os.environ.get("TARGET_ADDRESS", "txch1s8e2m4veaymm6n5v0k22yg89urud79np9knnx8dux80mgqmfw30qp3gy3e")
 TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
 
-recent_coins: deque = deque([], 50) # bytes of coinIDs already attempted
+recent_coins: deque = deque([], 50) # bytes of coinIDs recently attempted
 
 async def mine():
     client = CoinsetClient.testnet11()
@@ -53,11 +54,10 @@ async def mine():
                                 cat_lode_puzzlehash = cat_puzzle_hash(asset_id=TAIL_HASH, inner_puzzle_hash=LODE_PUZZLEHASH)
                                 if cr.coin.coin_id() in recent_coins:
                                     continue
-                                print("Found lode coin: ", cr.coin.coin_id().hex())
-                                recent_coins.append(cr.coin.coin_id())
                                 assert cr.coin.puzzle_hash == cat_lode_puzzlehash
                                 lode_puzzle = clvm.deserialize(LODE_PUZZLE_BYTES)
-                                solution_string = f"({cr.coin.amount} {1 + last_height} 0x{TARGET_PUZZLEHASH.hex()})"
+                                mine_height = 1 + last_height
+                                solution_string = f"({cr.coin.amount} {mine_height} 0x{TARGET_PUZZLEHASH.hex()})"
                                 spend = Spend(lode_puzzle, clvm.parse(solution_string))
                                 cat_spend = CatSpend(cat, spend)
                                 clvm.spend_cats([cat_spend])
@@ -77,12 +77,16 @@ async def mine():
                                             print(repr(bundle))
                                     continue
                                 if tx_result.success:
-                                    print("Submitted spend bundle, status:", tx_result.status, " Now it's just luck!")
+                                    recent_coins.append(cr.coin.coin_id())
+                                    print(f"Submitted mining spend bundle for height {mine_height}! May the luck of the mempool be with you!")
+                                if tx_result.error is not None:
+                                    print("Failed to submit mining spend bundle: ", tx_result.error)
         else:
             print("Failed to discover unspent coins")
             continue
-            
-        await asyncio.sleep(10)
+        # you could pound this harder, but it's not enough to be first--
+        # you also must slot the right block...
+        await asyncio.sleep(random.randint(5)) 
 
 def main():
     banner = """
