@@ -3,75 +3,21 @@ import os
 import signal
 import sys
 import json
+from collections import deque
+
 from chia_wallet_sdk import Address, CatSpend, Clvm, CoinsetClient, Signature, Spend, SpendBundle, cat_puzzle_hash
+from xkv8.utils import spend_bundle_to_json
 
 # global settings, suitable for deriving a new mineable CAT
-LODE_PUZZLEHASH = bytes.fromhex("7dfbdcb2ed94d70a210b427a5e1271ffb2024ecbe8c49039c34b5c9fa5159dea")
 LODE_PUZZLE_BYTES = bytes.fromhex("ff02ffff01ff04ffff04ff0affff04ff05ff808080ffff04ffff04ff04ffff01ff018080ffff04ffff04ff0effff04ff17ffff04ff05ffff04ffff04ff17ff8080ff8080808080ff80808080ffff04ffff01ff52ff4933ff018080")
+LODE_PUZZLEHASH = Clvm().deserialize(LODE_PUZZLE_BYTES).puzzle().puzzle_hash
 TAIL_HASH = bytes.fromhex("4eadfa450c19fa51df65eb7fbf5b61077ec80ec799a7652bb187b705bff19a90")
 
 # environment specific
-NETWORK_PREFIX = os.environ.get("NETWORK_PREFIX", "txch")
 TARGET_ADDRESS = os.environ.get("TARGET_ADDRESS", "txch1s8e2m4veaymm6n5v0k22yg89urud79np9knnx8dux80mgqmfw30qp3gy3e")
 TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
 
-
-def _hexify(obj):
-    if obj is None:
-        return None
-    # prefer explicit byte/serialize methods
-    for method_name in ("to_bytes", "serialize", "to_bytes_hex"):
-        method = getattr(obj, method_name, None)
-        if callable(method):
-            try:
-                b = method()
-                if isinstance(b, str):
-                    return b
-                return b.hex()
-            except Exception:
-                continue
-    try:
-        return bytes(obj).hex()
-    except Exception:
-        try:
-            return str(obj)
-        except Exception:
-            return None
-
-
-def spend_bundle_to_json(bundle):
-    data = {
-        "aggregated_signature": _hexify(getattr(bundle, "aggregated_signature", None)),
-        "coin_spends": [],
-    }
-
-    for cs in getattr(bundle, "coin_spends", []):
-        coin = getattr(cs, "coin", None)
-        coin_id = None
-        if coin is not None:
-            try:
-                coin_id = coin.name().hex()
-            except Exception:
-                try:
-                    coin_id = coin.coin_id().hex()
-                except Exception:
-                    coin_id = None
-
-        puzzle_reveal = _hexify(getattr(cs, "puzzle_reveal", None))
-        solution = _hexify(getattr(cs, "solution", None))
-
-        data["coin_spends"].append({
-            "coin": {
-                "parent_coin_info": _hexify(getattr(coin, "parent_coin_info", None)),
-                "puzzle_hash": _hexify(getattr(coin, "puzzle_hash", None)),
-                "amount": getattr(coin, "amount", None)
-            },
-            "coin_id": coin_id,
-            "puzzle_reveal": puzzle_reveal,
-            "solution": solution,
-        })
-
-    return json.dumps(data, indent=4)
+recent_coins: deque = deque([], 50) # bytes of coinIDs already attempted
 
 async def mine():
     client = CoinsetClient.testnet11()
@@ -83,15 +29,14 @@ async def mine():
             height = blockchain_state.blockchain_state.peak.height
             if height != last_height:
                 last_height = height
-                print(f"Mining at height: {height}")
+                if height % 100 == 0:
+                    print(f"Mining at height: {height}")
         else:
             print("Failed to get blockchain state")
             await asyncio.sleep(5)
             continue
 
-        cat_lode_puzzlehash = cat_puzzle_hash(asset_id=TAIL_HASH, inner_puzzle_hash=LODE_PUZZLEHASH)
-
-        unspent_crs = await client.get_coin_records_by_hint(LODE_PUZZLEHASH, start_height=None, end_height=None,include_spent_coins=False)
+        unspent_crs = await client.get_coin_records_by_hint(LODE_PUZZLEHASH, start_height=None, end_height=None, include_spent_coins=False)
         if unspent_crs.success:
             for cr in unspent_crs.coin_records:
                 parent_res = await client.get_coin_record_by_name(cr.coin.parent_coin_info)
@@ -105,11 +50,14 @@ async def mine():
                         cats = puzzle.parse_child_cats(parent_coin=parent.coin, parent_solution=parent_solution)
                         for cat in cats:
                             if cat.info.p2_puzzle_hash == LODE_PUZZLEHASH and cat.info.asset_id == TAIL_HASH:
-                                print("Found lode coin: ", cr.coin.coin_id().hex(), " amt: ", cr.coin.amount)
+                                cat_lode_puzzlehash = cat_puzzle_hash(asset_id=TAIL_HASH, inner_puzzle_hash=LODE_PUZZLEHASH)
+                                if cr.coin.coin_id() in recent_coins:
+                                    continue
+                                print("Found lode coin: ", cr.coin.coin_id().hex())
+                                recent_coins.append(cr.coin.coin_id())
                                 assert cr.coin.puzzle_hash == cat_lode_puzzlehash
                                 lode_puzzle = clvm.deserialize(LODE_PUZZLE_BYTES)
                                 solution_string = f"({cr.coin.amount} {1 + last_height} 0x{TARGET_PUZZLEHASH.hex()})"
-                                
                                 spend = Spend(lode_puzzle, clvm.parse(solution_string))
                                 cat_spend = CatSpend(cat, spend)
                                 clvm.spend_cats([cat_spend])
@@ -129,7 +77,7 @@ async def mine():
                                             print(repr(bundle))
                                     continue
                                 if tx_result.success:
-                                    print("Submitted spend bundle, tx id: ", tx_result.transaction_id.hex(), " Now it's just luck!")
+                                    print("Submitted spend bundle, status:", tx_result.status, " Now it's just luck!")
         else:
             print("Failed to discover unspent coins")
             continue
@@ -147,6 +95,7 @@ def main():
 """
     print(banner)
     print("Starting miner...mining to address: ", TARGET_ADDRESS)
+    #print("Searching for rewards to claim from puzzlehash: ", LODE_PUZZLEHASH.hex())
     signal.signal(signal.SIGINT, sigint_handler)
     asyncio.run(mine())
 
