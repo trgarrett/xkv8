@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import signal
 import sys
-import urllib.error
-import urllib.request
 from typing import Optional
-
-from clvm_tools_rs import compile as compile_clsp
 
 from chia_wallet_sdk import (
     Address,
@@ -23,27 +18,44 @@ from chia_wallet_sdk import (
     SpendBundle,
     cat_puzzle_hash,
 )
-from xkv8.utils import spend_bundle_to_json
+
+# ── Environment ──────────────────────────────────────────────────────────
+#
+# TARGET_ADDRESS: the address to receive mining rewards.  Must be set in the environment before running.
+# MINER_SECRET_KEY: optional 32-byte hex seed for miner's BLS secret key.  If not set, your leaderboard standings will be incorrect.
+#
+# a MUST-set value
+TARGET_ADDRESS = os.environ.get("TARGET_ADDRESS", None)
+if TARGET_ADDRESS is None:
+    print("Error: Required TARGET_ADDRESS environment variable not set")
+    sys.exit(1)
+TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
+
+# Miner secret key: 32-byte hex seed. Any valid BLS key will do, but hold on to it to manage your leaderboard nickname!
+_MINER_KEY_HEX = os.environ.get("MINER_SECRET_KEY", "")
+
+TESTNET = os.environ.get("TESTNET", None)
+
+if TESTNET is None and not TARGET_ADDRESS.startswith("xch"):
+    print("Error: TARGET_ADDRESS must be a mainnet address (starting with 'xch')")
+    sys.exit(1)
+elif not TARGET_ADDRESS.startswith("txch"):
+    print("Error: TARGET_ADDRESS must be a testnet address (starting with 'txch')")
+    sys.exit(1)
+
+# ──────────────────────────────────────────────────────────────────────────
 
 # ── Puzzle parameters (production, testnet11) ────────────────────────────
 CAT_TAIL_HASH = bytes.fromhex(
     "b0b56662d1a6732f0edbc0d428391b9250477042896e79135af4926e3ccac694"
 )
-GENESIS_HEIGHT = 3897519
+
+# you could change these...but then your miner won't find anything to mine.
+# left here as an exercise for anyone who wants to build their own mineable CAT
+GENESIS_HEIGHT = 3897519 #3901900
 EPOCH_LENGTH = 1_120_000
 BASE_REWARD = 10_000  # mojos
 BASE_DIFFICULTY = 2**238
-
-# ── Environment ──────────────────────────────────────────────────────────
-TARGET_ADDRESS = os.environ.get(
-    "TARGET_ADDRESS",
-    "txch12pfws6enm2jeqjt03pspqg6sjh50g86hl9xm24dx4cwwm2l88nmqwy99nd",
-)
-TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
-
-# Miner secret key: 32-byte hex seed.  If absent a random key is created
-# each run (fine for testing, but rewards go to TARGET_ADDRESS regardless).
-_MINER_KEY_HEX = os.environ.get("MINER_SECRET_KEY", "")
 
 # coin_id -> mine_height of last successful submission
 submitted_coins: dict[bytes, int] = {}
@@ -51,18 +63,49 @@ submitted_coins: dict[bytes, int] = {}
 CLVM = Clvm()
 
 
-# ── Compile & curry the real puzzle ──────────────────────────────────────
-
-def compile_puzzle() -> str:
-    """Compile puzzle.clsp from source and return the hex string."""
-    source = open("../clsp/puzzle.clsp").read()
-    return compile_clsp(source, ["../clsp/include/"])
+# ── Compiled puzzle (puzzle.clsp) ────────────────────────────────────────
+PUZZLE_HEX = (
+    "ff02ffff01ff02ff7effff04ff02ffff04ff8202ffffff04ffff02ff52ffff04ff02ffff04"
+    "ff0bffff04ff17ffff04ff8205ffff808080808080ffff04ff8205ffffff04ff820bffffff"
+    "04ff2fffff04ff8217ffffff04ff822fffffff04ff825fffffff04ffff02ff56ffff04ff02"
+    "ffff04ff81bfffff04ffff02ff26ffff04ff02ffff04ff820bffffff04ff2fffff04ff5fff"
+    "808080808080ff8080808080ffff04ffff02ff7affff04ff02ffff04ff82017fffff04ffff"
+    "02ff26ffff04ff02ffff04ff820bffffff04ff2fffff04ff5fff808080808080ff80808080"
+    "80ff80808080808080808080808080ffff04ffff01ffffffff3257ff53ff5249ffff48ff33"
+    "3cff01ff0102ffffffff02ffff03ff05ffff01ff0bff8201f2ffff02ff76ffff04ff02ffff"
+    "04ff09ffff04ffff02ff22ffff04ff02ffff04ff0dff80808080ff808080808080ffff0182"
+    "01b280ff0180ffff02ff2affff04ff02ffff04ff05ffff04ffff02ff5effff04ff02ffff04"
+    "ff05ff80808080ffff04ffff02ff5effff04ff02ffff04ff0bff80808080ffff04ff17ff80"
+    "808080808080ffffa04bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce2"
+    "3c7785459aa09dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718b"
+    "a7b2ffa102a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f6322"
+    "2a102a8d5dd63fba471ebcb1f3e8f7c1e1879b7152a6e7298a91ce119a63400ade7c5fff"
+    "f0bff820172ffff02ff76ffff04ff02ffff04ff05ffff04ffff02ff22ffff04ff02ffff04"
+    "ff07ff80808080ff808080808080ffff04ffff04ff78ffff04ff05ff808080ffff04ffff04"
+    "ff24ffff04ff0bff808080ffff04ffff04ff58ffff01ff018080ffff04ffff04ff28ffff04"
+    "ff2fff808080ffff04ffff04ff30ffff04ffff10ff2fffff010380ff808080ffff04ffff04"
+    "ff20ffff04ff5fffff04ffff0bff81bfff82017fff2f80ff80808080ffff04ffff04ff5cff"
+    "ff04ff5fff808080ffff04ffff04ff54ffff04ff81bfffff04ff8202ffffff04ffff04ff81"
+    "bfff8080ff8080808080ffff04ffff04ff54ffff04ff17ffff04ffff11ff05ff8202ff80ff"
+    "ff04ffff04ff17ff8080ff8080808080ffff04ffff04ff74ffff01ff248080ff8080808080"
+    "808080808080ff16ff05ffff11ff80ff0b8080ffffff02ffff03ffff15ffff05ffff14ffff"
+    "11ff05ff0b80ff178080ffff010380ffff01ff0103ffff01ff05ffff14ffff11ff05ff0b80"
+    "ff17808080ff0180ffff16ff05ffff11ff80ff0b8080ff0bff7cffff0bff7cff8201b2ff05"
+    "80ffff0bff7cff0bff8201328080ffff02ffff03ffff15ff05ff8080ffff01ff15ff0bff05"
+    "80ff8080ff0180ffff02ffff03ffff07ff0580ffff01ff0bff7cffff02ff5effff04ff02ff"
+    "ff04ff09ff80808080ffff02ff5effff04ff02ffff04ff0dff8080808080ffff01ff0bff2c"
+    "ff058080ff0180ff02ffff03ffff15ff2fff5f80ffff01ff02ffff03ffff02ff2effff04ff"
+    "02ffff04ffff0bff17ff81bfff2fff8202ff80ffff04ff820bffff8080808080ffff01ff02"
+    "ffff03ffff20ffff15ff8205ffff058080ffff01ff02ff5affff04ff02ffff04ff05ffff04"
+    "ff0bffff04ff17ffff04ff2fffff04ff81bfffff04ff82017fffff04ff8202ffffff04ff82"
+    "05ffff8080808080808080808080ffff01ff088080ff0180ffff01ff088080ff0180ffff01"
+    "ff088080ff0180ff018080"
+)
 
 
 def build_curried_puzzle(clvm: Clvm):
-    """Compile, curry, and return (curried_program, inner_puzzle_hash)."""
-    hex_str = compile_puzzle()
-    mod = clvm.deserialize(bytes.fromhex(hex_str))
+    """Curry the compiled puzzle and return (curried_program, inner_puzzle_hash)."""
+    mod = clvm.deserialize(bytes.fromhex(PUZZLE_HEX))
     mod_hash = mod.tree_hash()
 
     cat_mod_hash = Constants.cat_puzzle_hash()  # standard CAT v2 mod hash
@@ -89,7 +132,7 @@ def load_miner_key() -> SecretKey:
         return SecretKey.from_seed(seed)
     # deterministic fallback so the key is stable within a single run
     seed = os.urandom(32)
-    print(f"No MINER_SECRET_KEY set – generated ephemeral key (seed: {seed.hex()})")
+    print(f"No MINER_SECRET_KEY set – generated ephemeral key. You will be able to mine, but leaderboard standings will be impacted!")
     return SecretKey.from_seed(seed)
 
 
@@ -149,8 +192,6 @@ def find_valid_nonce(
 
 
 # ── Main mining loop ────────────────────────────────────────────────────
-
-COINSET_API_URL = "https://testnet11.api.coinset.org"
 
 # Known genesis challenges by network name
 GENESIS_CHALLENGES = {
@@ -228,7 +269,11 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
 
 
 async def mine():
-    client = RpcClient.testnet11()
+    client = None
+    if TESTNET is not None:
+        client = RpcClient.testnet11()
+    else:
+        client = RpcClient().mainnet()
 
     # Get genesis challenge for AGG_SIG_ME
     net_info = await client.get_network_info()
@@ -248,16 +293,16 @@ async def mine():
     curried_puzzle, inner_puzzle_hash, cat_mod_hash = build_curried_puzzle(CLVM)
     full_cat_puzzlehash = cat_puzzle_hash(CAT_TAIL_HASH, inner_puzzle_hash)
 
-    print(f"Inner puzzle hash: {inner_puzzle_hash.hex()}")
-    print(f"CAT puzzle hash:   {full_cat_puzzlehash.hex()}")
-    print(f"CAT TAIL hash:     {CAT_TAIL_HASH.hex()}")
+    #print(f"Inner puzzle hash: {inner_puzzle_hash.hex()}")
+    #print(f"CAT puzzle hash:   {full_cat_puzzlehash.hex()}")
+    #print(f"CAT TAIL hash:     {CAT_TAIL_HASH.hex()}")
 
     # Load miner key
     sk = load_miner_key()
     pk = sk.public_key()
     pk_bytes = pk.to_bytes()
-    print(f"Miner public key:  {pk_bytes.hex()}")
-    print(f"Mining to address:  {TARGET_ADDRESS}")
+    print(f"Miner public key: {pk_bytes.hex()}")
+    print(f"Mining to address: {TARGET_ADDRESS}")
     print()
 
     last_height = -1
@@ -291,6 +336,7 @@ async def mine():
         # Don't attempt mining before genesis height
         mine_height = 1 + last_height
         if mine_height < GENESIS_HEIGHT:
+            print(f"Waiting for genesis. {GENESIS_HEIGHT - mine_height} blocks to go!")
             await asyncio.sleep(15)
             continue
 
@@ -377,29 +423,10 @@ async def mine():
             )
 
             try:
-                payload = json.dumps(
-                    {"spend_bundle": json.loads(spend_bundle_to_json(bundle))}
-                ).encode()
-                ##print(payload)
-                req = urllib.request.Request(
-                    f"{COINSET_API_URL}/push_tx",
-                    data=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "User-Agent": "xkv8-miner/1.0",
-                    },
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        raw = resp.read()
-                except urllib.error.HTTPError as http_err:
-                    raw = http_err.read()
-                body = json.loads(raw)
-                success = body.get("success", False)
-                status_val = body.get("status")
-                error = body.get("error")
+                tx_res = await client.push_tx(bundle)
+                success = tx_res.success
+                status_val = getattr(tx_res, "status", None)
+                error = tx_res.error
             except Exception as e:
                 print(f"Failed to push tx: {repr(e)}")
                 continue
