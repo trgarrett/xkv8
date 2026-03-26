@@ -16,11 +16,9 @@ from chia_wallet_sdk import (
     Address,
     CatSpend,
     Clvm,
-    CoinsetClient,
+    RpcClient,
     Constants,
-    PublicKey,
     SecretKey,
-    Signature,
     Spend,
     SpendBundle,
     cat_puzzle_hash,
@@ -165,7 +163,7 @@ GENESIS_CHALLENGES = {
 }
 
 
-async def check_mining_results(client: CoinsetClient, inner_puzzle_hash: bytes):
+async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
     """Check if any previously submitted coins were mined, and whether by us."""
     to_remove = []
     for coin_id, sub_height in list(submitted_coins.items()):
@@ -225,7 +223,7 @@ async def check_mining_results(client: CoinsetClient, inner_puzzle_hash: bytes):
 
 
 async def mine():
-    client = CoinsetClient.testnet11()
+    client = RpcClient.testnet11()
 
     # Get genesis challenge for AGG_SIG_ME
     net_info = await client.get_network_info()
