@@ -196,19 +196,24 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
                     break
             mined_by_us = reward_mojos > 0
             if mined_by_us:
-                print()
-                print(r"      _.---.._")
-                print(r"     /_  __  _\        ___________")
-                print(r"     | \/  \/ |  ___   |           |")
-                print(r"     |  \__/  |=|   |==|   MINED   |")
-                print(r"      \      /  |___|  |___________|")
-                print(r"       '-..-'     |        ||")
-                print(r"         ||       |        ||")
-                print(r"    _____||_______|________||___")
-                print(r"   |   _________________________|")
-                print(r"   |  |     (o)          (o)")
-                print(r"   |__| ")
-                print()
+                excavator = r"""
+  .-.
+ \   /
+| (*) |-----....._____
+''.  |--.._           '--.._
+ | |  |     ''--.._       o  '.
+ | |  |             ''--.._\  \
+ | |  |                    \ \  \________
+ | |  |                     \ \ /____  _ |
+'-|__|                      \ //    || ||_________ .-----. _
+ | /*)                       //_____||=||=================|
+ |/-|                        \_________|_________________|
+.'  \                        '----._______.-------------`
+/     \                       ~.~.~.~.~.~.~.~.~.~.~.~.~.~
+\      '._.                  ((*))o o ======= o o o (*) ))
+ '.......`                   '-.~.~.~.~.~.~.~.~.~.~.~.~- `
+"""
+                print(excavator)
                 print(f"Win CONFIRMED at height {sub_height}!")
                 reward_cat_amount = reward_mojos / 1000
                 print(f"Reward of {reward_cat_amount:.3f} XKV8 sent to {TARGET_ADDRESS}")
