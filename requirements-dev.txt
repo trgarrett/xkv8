@@ -1,4 +1,6 @@
 chia_wallet_sdk==0.32.0
+# See requirements.txt for why we install from git
+chia_wallet_sdk @ git+https://github.com/xch-dev/chia-wallet-sdk.git@0.33.0#subdirectory=pyo3
 pytest-asyncio==1.2.0
 pytest==8.4.2
 anyio==4.12.1

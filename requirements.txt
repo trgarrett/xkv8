@@ -1,3 +1,8 @@
 aiohttp==3.13.3
-chia_wallet_sdk==0.32.0
+# chia-wallet-sdk >=0.29 does not publish manylinux wheels on PyPI.
+# The sdist is also broken (missing bindings.json for the proc-macro).
+# Install from the git repo so the full Cargo workspace is available at
+# build time.  Requires a Rust toolchain (rustup) and maturin on the
+# build host.
+chia_wallet_sdk @ git+https://github.com/xch-dev/chia-wallet-sdk.git@0.33.0#subdirectory=pyo3
 clvm_tools_rs==0.4.0
