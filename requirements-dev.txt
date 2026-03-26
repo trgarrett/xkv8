@@ -1,4 +1,4 @@
-chia_wallet_sdk==0.33.0
+chia_wallet_sdk==0.32.0
 pytest-asyncio==1.2.0
 pytest==8.4.2
 anyio==4.12.1
