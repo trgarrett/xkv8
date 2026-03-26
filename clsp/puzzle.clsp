@@ -1,27 +1,150 @@
-;; Mineable puzzle that stores coins and allows them to be mined according
-;; to a schedule.
+;; xkv8 - Mineable CAT Puzzle
 ;;
-;; Some requirements for this puzzle:
-;; 1. Coin has not been spent for at least 1 block -- but likely ~3 with only 1/3 on average being TX blocks
-;; 2. Height equals a specific user-provided height - no peeking ahead / stuffing mempool!
-;; 3. Creates reward to user address, rest back to puzzle hash
+;; A proof-of-uptime-and-luck mineable token on Chia.
+;;
+;; Curried parameters (immutable, set at creation):
+;;   MOD_HASH       - tree hash of this uncurried module (for self-hash derivation)
+;;   CAT_MOD_HASH   - tree hash of the CAT v2 outer puzzle module
+;;   CAT_TAIL_HASH  - tree hash of the TAIL program (identifies this CAT asset)
+;;   GENESIS_HEIGHT - block height when mining begins
+;;   EPOCH_LENGTH   - blocks per epoch (1,120,000 ~= 8 months)
+;;   BASE_REWARD    - initial reward per mine in mojos (10,000)
+;;   BASE_DIFFICULTY - initial PoW difficulty target (2^238)
+;;
+;; Solution parameters (provided per spend):
+;;   my_amount            - current coin amount
+;;   my_inner_puzzlehash  - inner puzzle hash of this coin (validated via ASSERT_MY_PUZZLEHASH)
+;;   user_height          - block height attempting to mine at
+;;   miner_pubkey         - miner's BLS public key (identity for leaderboard + signing)
+;;   target_puzzle_hash   - puzzle hash where reward is sent (miner's choice)
+;;   nonce                - grindable value for proof of work
+;;
+;; Security properties:
+;;   - Height-pinned to 3-block window to prevent replay and ensure luck-based mining
+;;   - PoW hash binds pubkey + height + nonce to this puzzle (work element)
+;;   - AGG_SIG_ME binds signature to coin_id (anti-solution-stealing)
+;;   - Signature covers target_puzzle_hash + height to prevent swapping
+;;   - REMARK records miner pubkey on-chain (leaderboard)
+;;   - Self-recreating with reduced amount (on-chain distribution)
+;;   - ASSERT_MY_PUZZLEHASH uses full CAT puzzle hash (binds to specific TAIL)
 
-(mod 
-   (
-      my_amount         ; Amount held in this coin
-      user_height       ; Height attempting to mine at
-      target_address    ; Address to mine to
-   )  
+(mod
+  (
+    MOD_HASH
+    CAT_MOD_HASH
+    CAT_TAIL_HASH
+    GENESIS_HEIGHT
+    EPOCH_LENGTH
+    BASE_REWARD
+    BASE_DIFFICULTY
+    my_amount
+    my_inner_puzzlehash
+    user_height
+    miner_pubkey
+    target_puzzle_hash
+    nonce
+  )
 
   (include condition_codes.clib)
-  ;;;(include curry.clib)
+  (include curry.clib)
 
-  (list
-    (list ASSERT_MY_AMOUNT my_amount)
-    (list ASSERT_HEIGHT_RELATIVE 1)
-    ;;;(list ASSERT_HEIGHT_ABSOLUTE user_height)
-    ;;;(list ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 1))
-    (list CREATE_COIN target_address my_amount (list target_address))
-    ;;;(list CREATE_COIN PUZZLE_HASH (- my_amount 1) (PUZZLE_HASH))
+  ;; Calculate the current epoch (0, 1, 2, or 3 max)
+  (defun get_epoch (user_height GENESIS_HEIGHT EPOCH_LENGTH)
+    (if (> (/ (- user_height GENESIS_HEIGHT) EPOCH_LENGTH) 3)
+      3
+      (/ (- user_height GENESIS_HEIGHT) EPOCH_LENGTH)
+    )
+  )
+
+  ;; Halve reward per epoch: BASE_REWARD >> epoch
+  ;; Epoch 0: BASE_REWARD, Epoch 1: BASE_REWARD/2, Epoch 2: BASE_REWARD/4, Epoch 3+: BASE_REWARD/8
+  (defun get_reward (BASE_REWARD epoch)
+    (ash BASE_REWARD (- 0 epoch))
+  )
+
+  ;; Halve difficulty target per epoch (= double the difficulty)
+  ;; Lower target = harder to find a valid hash
+  (defun get_difficulty (BASE_DIFFICULTY epoch)
+    (ash BASE_DIFFICULTY (- 0 epoch))
+  )
+
+  ;; Compute the full CAT puzzle hash by currying the CAT module with
+  ;; the CAT mod hash, TAIL hash, and inner puzzle hash.
+  ;; This is the on-chain puzzle hash of the CAT coin.
+  (defun cat_puzzle_hash (CAT_MOD_HASH CAT_TAIL_HASH inner_puzzle_hash)
+    (curry_hashes CAT_MOD_HASH
+      (sha256tree1 CAT_MOD_HASH)
+      (sha256tree1 CAT_TAIL_HASH)
+      inner_puzzle_hash  ; already a tree hash, don't double-hash
+    )
+  )
+
+  ;; Emit the mining conditions given validated inputs
+  (defun emit_conditions (my_amount my_cat_puzzlehash my_inner_puzzlehash user_height miner_pubkey target_puzzle_hash nonce reward)
+    (list
+      ;; Verify coin state (full CAT puzzle hash for on-chain validation)
+      (list ASSERT_MY_AMOUNT my_amount)
+      (list ASSERT_MY_PUZZLEHASH my_cat_puzzlehash)
+
+      ;; Make spends have a very narrow lifetime to prevent replay and ensure height binding (luck)
+      (list ASSERT_HEIGHT_RELATIVE 1)
+      (list ASSERT_HEIGHT_ABSOLUTE user_height)
+      (list ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 3))
+
+      ;; Require signature from miner (binds to coin_id via AGG_SIG_ME)
+      ;; Message covers target address + nonce + height to prevent swapping
+      (list AGG_SIG_ME miner_pubkey (sha256 target_puzzle_hash nonce user_height))
+
+      ;; Record miner identity on-chain for leaderboard
+      (list REMARK miner_pubkey)
+
+      ;; Pay reward to miner's chosen address
+      (list CREATE_COIN target_puzzle_hash reward (list target_puzzle_hash))
+
+      ;; Recreate the lode coin with remaining balance (inner puzzle hash for CAT layer)
+      (list CREATE_COIN my_inner_puzzlehash (- my_amount reward) (list my_inner_puzzlehash))
+
+      ;; give a hook for fee attaching (for the very motivated!)
+      (list CREATE_COIN_ANNOUNCEMENT '$')
+    )
+  )
+
+  ;; Check PoW: hash must be positive (first byte < 0x80) AND less than difficulty
+  ;; This prevents the signed-comparison bypass where negative hashes always pass
+  (defun pow_valid (pow_hash difficulty)
+    (if (> pow_hash 0)
+      (> difficulty pow_hash)
+      0
+    )
+  )
+
+  ;; Validate and emit: checks PoW, balance, and height, then produces conditions
+  ;; Balance check uses >= (not >) so the final mine can drain the coin to 0
+  (defun validate_and_emit
+    (my_amount my_cat_puzzlehash my_inner_puzzlehash user_height GENESIS_HEIGHT miner_pubkey target_puzzle_hash nonce reward difficulty)
+    (if (> user_height GENESIS_HEIGHT)
+      (if (pow_valid (sha256 my_inner_puzzlehash miner_pubkey user_height nonce) difficulty)
+        (if (not (> reward my_amount))
+          (emit_conditions my_amount my_cat_puzzlehash my_inner_puzzlehash user_height miner_pubkey target_puzzle_hash nonce reward)
+          (x)
+        )
+        (x)
+      )
+      (x)
+    )
+  )
+
+  ;; Main entry point
+  (validate_and_emit
+    my_amount
+    (cat_puzzle_hash CAT_MOD_HASH CAT_TAIL_HASH my_inner_puzzlehash)
+    my_inner_puzzlehash
+    user_height
+    GENESIS_HEIGHT
+    miner_pubkey
+    target_puzzle_hash
+    nonce
+    (get_reward BASE_REWARD (get_epoch user_height GENESIS_HEIGHT EPOCH_LENGTH))
+    (get_difficulty BASE_DIFFICULTY (get_epoch user_height GENESIS_HEIGHT EPOCH_LENGTH))
   )
 )

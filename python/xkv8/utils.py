@@ -23,20 +23,26 @@ def _hexify(obj):
 
 
 def spend_bundle_to_json(bundle):
+    def _0x(val):
+        h = _hexify(val)
+        if h is not None and not h.startswith("0x"):
+            return "0x" + h
+        return h
+
     data = {
-        "aggregated_signature": _hexify(getattr(bundle, "aggregated_signature", None)),
+        "aggregated_signature": _0x(getattr(bundle, "aggregated_signature", None)),
         "coin_spends": [],
     }
 
     for cs in getattr(bundle, "coin_spends", []):
         coin = getattr(cs, "coin", None)
-        puzzle_reveal = _hexify(getattr(cs, "puzzle_reveal", None))
-        solution = _hexify(getattr(cs, "solution", None))
+        puzzle_reveal = _0x(getattr(cs, "puzzle_reveal", None))
+        solution = _0x(getattr(cs, "solution", None))
 
         data["coin_spends"].append({
             "coin": {
-                "parent_coin_info": _hexify(getattr(coin, "parent_coin_info", None)),
-                "puzzle_hash": _hexify(getattr(coin, "puzzle_hash", None)),
+                "parent_coin_info": _0x(getattr(coin, "parent_coin_info", None)),
+                "puzzle_hash": _0x(getattr(coin, "puzzle_hash", None)),
                 "amount": getattr(coin, "amount", None),
             },
             "puzzle_reveal": puzzle_reveal,

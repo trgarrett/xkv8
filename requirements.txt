@@ -1,1 +1,3 @@
-chia_wallet_sdk
+aiohttp==3.13.3
+chia_wallet_sdk==0.32.0
+clvm_tools_rs==0.4.0
