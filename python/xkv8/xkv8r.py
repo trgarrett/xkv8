@@ -154,7 +154,6 @@ def find_valid_nonce(
 
 COINSET_API_URL = "https://testnet11.api.coinset.org"
 
-
 # Known genesis challenges by network name
 GENESIS_CHALLENGES = {
     "testnet11": bytes.fromhex(
