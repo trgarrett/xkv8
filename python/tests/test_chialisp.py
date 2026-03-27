@@ -208,7 +208,7 @@ def test_puzzle_accepts_valid_pow():
     # ASSERT_MY_AMOUNT, ASSERT_MY_PUZZLEHASH, ASSERT_HEIGHT_RELATIVE,
     # ASSERT_HEIGHT_ABSOLUTE, ASSERT_BEFORE_HEIGHT_ABSOLUTE,
     # AGG_SIG_ME, REMARK, CREATE_COIN (reward), CREATE_COIN (self)
-    assert len(conditions) == 9, f"Expected 9 conditions, got {len(conditions)}"
+    assert len(conditions) == 10, f"Expected 10 conditions, got {len(conditions)}"
 
 
 def test_self_hash_matches_curried_hash():
