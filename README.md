@@ -25,7 +25,7 @@ pip install -r requirements.txt
 # to run in foreground
 cd python
 
-MINER_SECRET_KEY="REDACTED" TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" python3 -m xkv8.xkv8r
+MINER_SECRET_KEY="YOUR_CHOSEN_BLS_KEY" TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" python3 -m xkv8.xkv8r
 ```
 
 # FAQ

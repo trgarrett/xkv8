@@ -294,7 +294,7 @@ async def mine():
     full_cat_puzzlehash = cat_puzzle_hash(CAT_TAIL_HASH, inner_puzzle_hash)
 
     print(f"Lode puzzle hash: {inner_puzzle_hash.hex()}")
-    #print(f"CAT puzzle hash:   {full_cat_puzzlehash.hex()}")
+    print(f"Lode full CAT puzzle hash: {full_cat_puzzlehash.hex()}")
     #print(f"CAT TAIL hash:     {CAT_TAIL_HASH.hex()}")
 
     # Load miner key
