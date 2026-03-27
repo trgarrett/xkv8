@@ -45,14 +45,14 @@ elif not TARGET_ADDRESS.startswith("txch"):
 
 # ──────────────────────────────────────────────────────────────────────────
 
-# ── Puzzle parameters (production, testnet11) ────────────────────────────
+# ── Puzzle parameters (differ by network) ────────────────────────────
 CAT_TAIL_HASH = bytes.fromhex(
     "b0b56662d1a6732f0edbc0d428391b9250477042896e79135af4926e3ccac694"
 )
 
 # you could change these...but then your miner won't find anything to mine.
 # left here as an exercise for anyone who wants to build their own mineable CAT
-GENESIS_HEIGHT = 3897519 #3901900
+GENESIS_HEIGHT = 3903575 #3897519 #3901900
 EPOCH_LENGTH = 1_120_000
 BASE_REWARD = 10_000  # mojos
 BASE_DIFFICULTY = 2**238
@@ -293,7 +293,7 @@ async def mine():
     curried_puzzle, inner_puzzle_hash, cat_mod_hash = build_curried_puzzle(CLVM)
     full_cat_puzzlehash = cat_puzzle_hash(CAT_TAIL_HASH, inner_puzzle_hash)
 
-    #print(f"Inner puzzle hash: {inner_puzzle_hash.hex()}")
+    print(f"Lode puzzle hash: {inner_puzzle_hash.hex()}")
     #print(f"CAT puzzle hash:   {full_cat_puzzlehash.hex()}")
     #print(f"CAT TAIL hash:     {CAT_TAIL_HASH.hex()}")
 
