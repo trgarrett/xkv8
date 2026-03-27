@@ -39,7 +39,7 @@ TESTNET = os.environ.get("TESTNET", None)
 if TESTNET is None and not TARGET_ADDRESS.startswith("xch"):
     print("Error: TARGET_ADDRESS must be a mainnet address (starting with 'xch')")
     sys.exit(1)
-elif not TARGET_ADDRESS.startswith("txch"):
+elif TESTNET is not None and not TARGET_ADDRESS.startswith("txch"):
     print("Error: TARGET_ADDRESS must be a testnet address (starting with 'txch')")
     sys.exit(1)
 
@@ -47,12 +47,12 @@ elif not TARGET_ADDRESS.startswith("txch"):
 
 # ── Puzzle parameters (differ by network) ────────────────────────────
 CAT_TAIL_HASH = bytes.fromhex(
-    "b0b56662d1a6732f0edbc0d428391b9250477042896e79135af4926e3ccac694"
+    "f09c8d630a0a64eb4633c0933e0ca131e646cebb384cfc4f6718bad80859b5e8"
 )
 
 # you could change these...but then your miner won't find anything to mine.
 # left here as an exercise for anyone who wants to build their own mineable CAT
-GENESIS_HEIGHT = 3903575 #3897519 #3901900
+GENESIS_HEIGHT = 8521888
 EPOCH_LENGTH = 1_120_000
 BASE_REWARD = 10_000  # mojos
 BASE_DIFFICULTY = 2**238
@@ -273,7 +273,7 @@ async def mine():
     if TESTNET is not None:
         client = RpcClient.testnet11()
     else:
-        client = RpcClient().mainnet()
+        client = RpcClient.mainnet()
 
     # Get genesis challenge for AGG_SIG_ME
     net_info = await client.get_network_info()
