@@ -47,3 +47,5 @@ MINER_SECRET_KEY="YOUR_CHOSEN_BLS_KEY" TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" 
 4. Q: Can I increase my odds?
    
    A: Keep your miner up and running. If block fee pressure becomes a thing, you could choose to inject a fee (some assembly required). Because of Chia's mempool Replace By Fee (RBF) rules, the first fee-paying spend that makes it to the Chia winning farmer will likely be chosen. You can try to buy your luck, but it will only go so far. But Chia farmers would love for you to try anyway!
+
+   Whether or not you can mine a winning solution in time is greatly dependent on block propagation, block intervals, mempool propagation, custom mempool implementations, and various other minutiae. Good luck!
