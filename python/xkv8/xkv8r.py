@@ -340,7 +340,9 @@ async def mine():
             await asyncio.sleep(15)
             continue
 
-        for cr in unspent_crs.coin_records:
+        # Only attempt to mine the largest coin if multiple are found
+        largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
+        for cr in [largest_cr]:
 
             # Skip if this coin was already submitted within its 3-block validity window
             # (puzzle enforces ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 3))

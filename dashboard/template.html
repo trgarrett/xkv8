@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XKV8 Mining Dashboard</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #16161f;
+            --bg-table-row: #1a1a25;
+            --bg-table-row-alt: #1e1e2a;
+            --bg-table-hover: #252535;
+            --border-color: #2a2a3a;
+            --gold: #c9a84c;
+            --gold-light: #e0c068;
+            --gold-dark: #a08030;
+            --cyan: #00b4ff;
+            --cyan-glow: #00b4ff80;
+            --cyan-light: #40ccff;
+            --text-primary: #e8e8f0;
+            --text-secondary: #9898a8;
+            --text-muted: #606070;
+            --green: #4caf50;
+            --red: #f44336;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(180deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.5rem 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+        }
+
+        .header img {
+            width: 64px;
+            height: 64px;
+            border-radius: 12px;
+        }
+
+        .header-text h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--gold-light), var(--gold), var(--gold-dark));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-text p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-top: 0.15rem;
+        }
+
+        .stats-bar {
+            display: flex;
+            gap: 1.5rem;
+            padding: 1.5rem 2rem;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.25rem 1.5rem;
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .stat-card .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-card .value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .stat-card .value.gold { color: var(--gold-light); }
+        .stat-card .value.cyan { color: var(--cyan); }
+
+        .stat-card .sub {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0;
+            padding: 0 2rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .tab {
+            padding: 0.85rem 1.5rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s ease;
+            user-select: none;
+        }
+
+        .tab:hover { color: var(--text-primary); }
+        .tab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+
+        .content { padding: 1.5rem 2rem; }
+        .section { display: none; }
+        .section.active { display: block; }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .section-header h2 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .section-header .badge {
+            background: var(--bg-table-row-alt);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 0.3rem 0.85rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .table-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .table-scroll { overflow-x: auto; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        thead th {
+            background: var(--bg-secondary);
+            padding: 0.85rem 1rem;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+        }
+
+        thead th:first-child { padding-left: 1.25rem; }
+
+        tbody tr {
+            border-bottom: 1px solid var(--border-color);
+            transition: background 0.15s ease;
+        }
+
+        tbody tr:last-child { border-bottom: none; }
+        tbody tr:nth-child(odd) { background: var(--bg-table-row); }
+        tbody tr:nth-child(even) { background: var(--bg-table-row-alt); }
+        tbody tr:hover { background: var(--bg-table-hover); }
+
+        td {
+            padding: 0.75rem 1rem;
+            white-space: nowrap;
+        }
+
+        td:first-child { padding-left: 1.25rem; }
+
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+
+        .rank { font-weight: 700; color: var(--text-muted); width: 50px; }
+        .rank-1 { color: var(--gold-light); }
+        .rank-2 { color: #c0c0c0; }
+        .rank-3 { color: #cd7f32; }
+
+        .block-height { color: var(--cyan); font-weight: 500; }
+        .reward { color: var(--gold-light); font-weight: 600; }
+        .balance { color: var(--green); font-weight: 600; }
+        .total-mined { color: var(--cyan-light); font-weight: 600; }
+
+        .address {
+            color: var(--text-secondary);
+            max-width: 320px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .pubkey {
+            color: var(--text-secondary);
+            max-width: 280px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .time-ago { color: var(--text-muted); font-size: 0.8rem; }
+
+        @media (max-width: 768px) {
+            .header { padding: 1rem; }
+            .stats-bar { padding: 1rem; gap: 0.75rem; }
+            .stat-card { min-width: 140px; padding: 1rem; }
+            .stat-card .value { font-size: 1.2rem; }
+            .tabs { padding: 0 1rem; overflow-x: auto; }
+            .content { padding: 1rem; }
+        }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-primary); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        .logo-glow { position: relative; display: inline-block; }
+        .logo-glow::after {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--gold-dark), var(--cyan-glow));
+            z-index: -1;
+            opacity: 0.4;
+            filter: blur(8px);
+        }
+
+        .logo-fallback {
+            width: 64px;
+            height: 64px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #1a1a2e, #0f0f1a);
+            border: 2px solid var(--gold-dark);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1.1rem;
+            background-clip: padding-box;
+        }
+
+        .logo-fallback span {
+            background: linear-gradient(135deg, var(--gold-light), var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .logo-fallback .eight {
+            background: linear-gradient(135deg, var(--cyan-light), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            filter: drop-shadow(0 0 4px var(--cyan-glow));
+        }
+
+        .wins-count {
+            display: inline-block;
+            background: linear-gradient(135deg, var(--cyan), #0088cc);
+            color: #fff;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.15rem 0.5rem;
+            border-radius: 10px;
+            margin-left: 0.5rem;
+            vertical-align: middle;
+        }
+
+        .updated-at {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            margin-left: auto;
+            padding-right: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <div class="header">
+        <div class="logo-glow">
+            <img src="assets/logo.png" alt="XKV8 Logo" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+            <div class="logo-fallback" style="display:none;"><span>XKV</span><span class="eight">8</span></div>
+        </div>
+        <div class="header-text">
+            <h1>XKV8 Mining Dashboard</h1>
+            <p>Statistics and leaderboards</p>
+        </div>
+        <div class="updated-at">Last updated: {{ updated_at }}</div>
+    </div>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+        <div class="stat-card">
+            <div class="label">Total XKV8 Mined</div>
+            <div class="value gold">{{ stats.total_mined }}</div>
+            <div class="sub">All time</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Current Block Height</div>
+            <div class="value">{{ stats.current_block_height }}</div>
+            {% if stats.current_block_height | replace(",", "") | int < 8521888 %}
+            <div class="sub">{{ "{:,}".format(8521888 - (stats.current_block_height | replace(",", "") | int)) }} blocks until genesis</div>
+            {% else %}
+            <div class="sub">Chia Blockchain</div>
+            {% endif %}
+        </div>
+        <div class="stat-card">
+            <div class="label">Reward Per Block</div>
+            <div class="value gold">{{ stats.reward_per_block }}</div>
+            <div class="sub">Epoch {{ stats.current_epoch }} of 3 · halves each epoch</div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <div class="tab" onclick="switchTab('recent-wins')">🏆 Recent Wins</div>
+        <div class="tab active" onclick="switchTab('leaderboard')">⛏️ Mining Leaderboard</div>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+
+        <!-- Recent Wins -->
+        <div id="recent-wins" class="section">
+            <div class="section-header">
+                <h2>Recent Wins <span class="wins-count">{{ recent_wins | length }}</span></h2>
+                <div class="badge">Updated {{ updated_at }}</div>
+            </div>
+            <div class="table-container">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Block Height</th>
+                                <th>Pubkey</th>
+                                <th>Reward</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for win in recent_wins %}
+                            <tr>
+                                <td class="rank">{{ loop.index }}</td>
+                                <td class="block-height mono">{{ win.block_height }}</td>
+                                <td class="pubkey mono" title="{{ win.pubkey }}">{{ win.pubkey[:16] }}...{{ win.pubkey[-8:] }}</td>
+                                <td class="reward">{{ win.reward }} XKV8</td>
+                                <td class="time-ago">{{ win.time_ago }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Mining Leaderboard -->
+        <div id="leaderboard" class="section active">
+            <div class="section-header">
+                <h2>Mining Leaderboard</h2>
+                <div class="badge">By total mined</div>
+            </div>
+            <div class="table-container">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rank</th>
+                                <th>Pubkey</th>
+                                <th>Total Mined (XKV8)</th>
+                                <th>Blocks Won</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for miner in leaderboard %}
+                            <tr>
+                                <td class="rank {% if loop.index == 1 %}rank-1{% elif loop.index == 2 %}rank-2{% elif loop.index == 3 %}rank-3{% endif %}">{{ loop.index }}</td>
+                                <td class="pubkey mono" title="{{ miner.pubkey }}">{{ miner.pubkey[:16] }}...{{ miner.pubkey[-8:] }}</td>
+                                <td class="total-mined">{{ miner.total_mined }} XKV8</td>
+                                <td>{{ miner.blocks_won }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        function switchTab(tabId) {
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            const tabs = document.querySelectorAll('.tab');
+            const tabMap = { 'recent-wins': 0, 'leaderboard': 1 };
+            tabs[tabMap[tabId]].classList.add('active');
+        }
+    </script>
+
+</body>
+</html>
