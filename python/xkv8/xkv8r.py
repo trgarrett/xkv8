@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
+import random
 import os
 import signal
 import sys
+import threading
 from typing import Optional
 
 from chia_wallet_sdk import (
@@ -34,6 +37,8 @@ TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
 # Miner secret key: 32-byte hex seed. Any valid BLS key will do, but hold on to it to manage your leaderboard nickname!
 _MINER_KEY_HEX = os.environ.get("MINER_SECRET_KEY", "")
 
+THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "1"))
+
 TESTNET = os.environ.get("TESTNET", None)
 
 if TESTNET is None and not TARGET_ADDRESS.startswith("xch"):
@@ -42,6 +47,9 @@ if TESTNET is None and not TARGET_ADDRESS.startswith("xch"):
 elif TESTNET is not None and not TARGET_ADDRESS.startswith("txch"):
     print("Error: TARGET_ADDRESS must be a testnet address (starting with 'txch')")
     sys.exit(1)
+
+DEFAULT_SLEEP=5
+ERROR_SLEEP=2
 
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -170,6 +178,30 @@ def get_difficulty(epoch: int) -> int:
     return BASE_DIFFICULTY >> epoch
 
 
+def _search_nonce_range(
+    inner_puzzle_hash: bytes,
+    miner_pubkey_bytes: bytes,
+    h_bytes: bytes,
+    difficulty: int,
+    start: int,
+    end: int,
+    found_event: threading.Event,
+) -> Optional[int]:
+    """Search a slice of the nonce space. Returns a valid nonce or None."""
+    for nonce in range(start, end):
+        if found_event.is_set():
+            return None
+        n_bytes = int_to_clvm_bytes(nonce)
+        digest = hashlib.sha256(
+            inner_puzzle_hash + miner_pubkey_bytes + h_bytes + n_bytes
+        ).digest()
+        pow_int = int.from_bytes(digest, "big")
+        if pow_int > 0 and difficulty > pow_int:
+            found_event.set()
+            return nonce
+    return None
+
+
 def find_valid_nonce(
     inner_puzzle_hash: bytes,
     miner_pubkey_bytes: bytes,
@@ -177,17 +209,52 @@ def find_valid_nonce(
     difficulty: int,
     max_attempts: int = 5_000_000,
 ) -> Optional[int]:
-    """Grind for a nonce that satisfies the PoW target."""
+    """Grind for a nonce that satisfies the PoW target using up to THREAD_COUNT threads."""
     h_bytes = int_to_clvm_bytes(user_height)
-    for nonce in range(max_attempts):
-        n_bytes = int_to_clvm_bytes(nonce)
-        digest = hashlib.sha256(
-            inner_puzzle_hash + miner_pubkey_bytes + h_bytes + n_bytes
-        ).digest()
-        pow_int = int.from_bytes(digest, "big")
-        # must be positive (first byte < 0x80) AND less than difficulty
-        if pow_int > 0 and difficulty > pow_int:
-            return nonce
+
+    if THREAD_COUNT <= 1:
+        # Single-threaded fast path
+        for nonce in range(max_attempts):
+            n_bytes = int_to_clvm_bytes(nonce)
+            digest = hashlib.sha256(
+                inner_puzzle_hash + miner_pubkey_bytes + h_bytes + n_bytes
+            ).digest()
+            pow_int = int.from_bytes(digest, "big")
+            if pow_int > 0 and difficulty > pow_int:
+                return nonce
+        return None
+
+    # Multi-threaded path
+    found_event = threading.Event()
+    chunk_size = (max_attempts + THREAD_COUNT - 1) // THREAD_COUNT
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
+        futures = []
+        for i in range(THREAD_COUNT):
+            start = i * chunk_size
+            end = min(start + chunk_size, max_attempts)
+            if start >= max_attempts:
+                break
+            futures.append(
+                executor.submit(
+                    _search_nonce_range,
+                    inner_puzzle_hash,
+                    miner_pubkey_bytes,
+                    h_bytes,
+                    difficulty,
+                    start,
+                    end,
+                    found_event,
+                )
+            )
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result is not None:
+                # Cancel remaining futures and return the found nonce
+                found_event.set()
+                return result
+
     return None
 
 
@@ -270,23 +337,15 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
 
 async def mine():
     client = None
+    genesis_challenge = None
+    
     if TESTNET is not None:
         client = RpcClient.testnet11()
+        genesis_challenge = GENESIS_CHALLENGES["testnet11"]
     else:
         client = RpcClient.mainnet()
+        genesis_challenge = GENESIS_CHALLENGES["mainnet"]
 
-    # Get genesis challenge for AGG_SIG_ME
-    net_info = await client.get_network_info()
-    genesis_challenge = net_info.genesis_challenge
-    if genesis_challenge is None and net_info.network_name is not None:
-        genesis_challenge = GENESIS_CHALLENGES.get(net_info.network_name)
-    if genesis_challenge is None:
-        print(
-            f"Failed to get genesis challenge "
-            f"(success={net_info.success}, network_name={net_info.network_name}, "
-            f"error={net_info.error})"
-        )
-        return
     #print(f"Genesis challenge: {genesis_challenge.hex()}")
 
     # Compile & curry the puzzle once
@@ -308,143 +367,146 @@ async def mine():
     last_height = -1
 
     while True:
-        blockchain_state = await client.get_blockchain_state()
-        if not blockchain_state.success:
-            print("Failed to get blockchain state")
-            await asyncio.sleep(5)
-            continue
-
-        height = blockchain_state.blockchain_state.peak.height
-        if height != last_height:
-            last_height = height
-            if height % 100 == 0:
-                print(f"Height: {height}")
-
-            # Check if any previously submitted coins were confirmed
-            if submitted_coins:
-                await check_mining_results(client, inner_puzzle_hash)
-
-        # Search for unspent lode coins by puzzle hash
-        unspent_crs = await client.get_coin_records_by_puzzle_hash(
-            full_cat_puzzlehash, None, None, False,
-        )
-        if not unspent_crs.success:
-            print("Failed to discover unspent coins")
-            await asyncio.sleep(5)
-            continue
-
-        # Don't attempt mining before genesis height
-        mine_height = 1 + last_height
-        if mine_height < GENESIS_HEIGHT:
-            print(f"Waiting for genesis. {GENESIS_HEIGHT - mine_height} blocks to go!")
-            await asyncio.sleep(15)
-            continue
-
-        # Only attempt to mine the largest coin if multiple are found
-        largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
-        for cr in [largest_cr]:
-
-            # Skip if this coin was already submitted within its 3-block validity window
-            # (puzzle enforces ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 3))
-            coin_id_key = cr.coin.coin_id()
-            last_sub = submitted_coins.get(coin_id_key)
-            if last_sub is not None and mine_height < last_sub + 3:
-                continue
-            epoch = get_epoch(mine_height)
-            reward = get_reward(epoch)
-            difficulty = get_difficulty(epoch)
-
-            if cr.coin.amount < reward:
-                print(f"Lode coin amount ({cr.coin.amount}) less than reward ({reward}), skipping")
+        try:
+            blockchain_state = await client.get_blockchain_state()
+            if not blockchain_state.success:
+                print("Failed to get blockchain state")
+                await asyncio.sleep(ERROR_SLEEP * (0.5 + random.random()))
                 continue
 
-            # Grind for a valid nonce
-            nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
-            if nonce is None:
-                print(f"Could not find valid nonce for height {mine_height}")
-                continue
+            height = blockchain_state.blockchain_state.peak.height
+            if height != last_height:
+                last_height = height
+                if height % 100 == 0:
+                    print(f"Height: {height}")
 
-            #print(f"Found nonce {nonce} for coin {cr.coin.coin_id().hex()} at height {mine_height} (epoch {epoch}, reward {reward}, difficulty 2^{difficulty.bit_length()-1})")
+                # Check if any previously submitted coins were confirmed
+                if submitted_coins:
+                    await check_mining_results(client, inner_puzzle_hash)
 
-            # Get parent spend to reconstruct CAT lineage
-            parent_res = await client.get_coin_record_by_name(cr.coin.parent_coin_info)
-            if not parent_res.success or parent_res.coin_record is None:
-                print("Failed to get parent coin record")
-                continue
-
-            parent = parent_res.coin_record
-            gps_res = await client.get_puzzle_and_solution(parent.coin.coin_id(), parent.spent_block_index)
-            if not gps_res.success:
-                print("Failed to get parent puzzle and solution")
-                continue
-
-            puzzle = CLVM.deserialize(gps_res.coin_solution.puzzle_reveal).puzzle()
-            parent_solution = CLVM.deserialize(gps_res.coin_solution.solution)
-            cats = puzzle.parse_child_cats(parent.coin, parent_solution)
-
-            if cats is None:
-                print("Failed to parse child CATs from parent")
-                continue
-
-            target_cat = None
-            for cat in cats:
-                if cat.info.p2_puzzle_hash == inner_puzzle_hash and cat.info.asset_id == CAT_TAIL_HASH:
-                    target_cat = cat
-                    break
-
-            if target_cat is None:
-                print("Could not find matching CAT child")
-                continue
-
-            # Build the inner puzzle solution
-            # Solution: (my_amount my_inner_puzzlehash user_height miner_pubkey target_puzzle_hash nonce)
-            solution_str = (
-                f"({cr.coin.amount} "
-                f"0x{inner_puzzle_hash.hex()} "
-                f"{mine_height} "
-                f"0x{pk_bytes.hex()} "
-                f"0x{TARGET_PUZZLEHASH.hex()} "
-                f"{nonce})"
+            # Search for unspent lode coins by puzzle hash
+            unspent_crs = await client.get_coin_records_by_puzzle_hash(
+                full_cat_puzzlehash, None, None, False,
             )
-
-            inner_spend = Spend(curried_puzzle, CLVM.parse(solution_str))
-            cat_spend = CatSpend(target_cat, inner_spend)
-            CLVM.spend_cats([cat_spend])
-
-            # Sign with AGG_SIG_ME
-            # Message from puzzle: sha256(target_puzzle_hash + nonce + user_height)
-            agg_sig_msg = pow_sha256(TARGET_PUZZLEHASH, nonce, mine_height)
-            # Full signed message: msg + coin_id + genesis_challenge
-            coin_id = cr.coin.coin_id()
-            full_msg = agg_sig_msg + coin_id + genesis_challenge
-            sig = sk.sign(full_msg)
-
-            bundle = SpendBundle(
-                CLVM.coin_spends(),
-                sig,
-            )
-
-            try:
-                tx_res = await client.push_tx(bundle)
-                success = tx_res.success
-                status_val = getattr(tx_res, "status", None)
-                error = tx_res.error
-            except Exception as e:
-                print(f"Failed to push tx: {repr(e)}")
+            if not unspent_crs.success:
+                print("Failed to discover unspent coins")
+                await asyncio.sleep(ERROR_SLEEP * (0.5 + random.random()))
                 continue
 
-            if success:
-                submitted_coins[coin_id_key] = mine_height
-                # Prune stale entries beyond the 3-block window
-                for k in [k for k, v in submitted_coins.items() if mine_height >= v + 3]:
-                    del submitted_coins[k]
-                print(
-                    f"Submitted mining spend bundle for height {mine_height}, Status={status_val}"
+            # Don't attempt mining before genesis height
+            mine_height = 1 + last_height
+            if mine_height < GENESIS_HEIGHT:
+                print(f"Waiting for genesis. {GENESIS_HEIGHT - mine_height} blocks to go!")
+                await asyncio.sleep(DEFAULT_SLEEP)
+                continue
+
+            # Only attempt to mine the largest coin if multiple are found
+            largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
+            for cr in [largest_cr]:
+
+                # Skip if this coin was already submitted within its 3-block validity window
+                # (puzzle enforces ASSERT_BEFORE_HEIGHT_ABSOLUTE (+ user_height 3))
+                coin_id_key = cr.coin.coin_id()
+                last_sub = submitted_coins.get(coin_id_key)
+                if last_sub is not None and mine_height < last_sub + 3:
+                    continue
+                epoch = get_epoch(mine_height)
+                reward = get_reward(epoch)
+                difficulty = get_difficulty(epoch)
+
+                if cr.coin.amount < reward:
+                    print(f"Lode coin amount ({cr.coin.amount}) less than reward ({reward}), skipping")
+                    continue
+
+                # Grind for a valid nonce
+                nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
+                if nonce is None:
+                    print(f"Could not find valid nonce for height {mine_height}")
+                    continue
+
+                #print(f"Found nonce {nonce} for coin {cr.coin.coin_id().hex()} at height {mine_height} (epoch {epoch}, reward {reward}, difficulty 2^{difficulty.bit_length()-1})")
+
+                # Get parent spend to reconstruct CAT lineage
+                parent_res = await client.get_coin_record_by_name(cr.coin.parent_coin_info)
+                if not parent_res.success or parent_res.coin_record is None:
+                    print("Failed to get parent coin record")
+                    continue
+
+                parent = parent_res.coin_record
+                gps_res = await client.get_puzzle_and_solution(parent.coin.coin_id(), parent.spent_block_index)
+                if not gps_res.success:
+                    print("Failed to get parent puzzle and solution")
+                    continue
+
+                puzzle = CLVM.deserialize(gps_res.coin_solution.puzzle_reveal).puzzle()
+                parent_solution = CLVM.deserialize(gps_res.coin_solution.solution)
+                cats = puzzle.parse_child_cats(parent.coin, parent_solution)
+
+                if cats is None:
+                    print("Failed to parse child CATs from parent")
+                    continue
+
+                target_cat = None
+                for cat in cats:
+                    if cat.info.p2_puzzle_hash == inner_puzzle_hash and cat.info.asset_id == CAT_TAIL_HASH:
+                        target_cat = cat
+                        break
+
+                if target_cat is None:
+                    print("Could not find matching CAT child")
+                    continue
+
+                # Build the inner puzzle solution
+                # Solution: (my_amount my_inner_puzzlehash user_height miner_pubkey target_puzzle_hash nonce)
+                solution_str = (
+                    f"({cr.coin.amount} "
+                    f"0x{inner_puzzle_hash.hex()} "
+                    f"{mine_height} "
+                    f"0x{pk_bytes.hex()} "
+                    f"0x{TARGET_PUZZLEHASH.hex()} "
+                    f"{nonce})"
                 )
-            else:
-                print(f"Failed to submit mining spend bundle: {error}")
 
-        await asyncio.sleep(15)
+                inner_spend = Spend(curried_puzzle, CLVM.parse(solution_str))
+                cat_spend = CatSpend(target_cat, inner_spend)
+                CLVM.spend_cats([cat_spend])
+
+                # Sign with AGG_SIG_ME
+                # Message from puzzle: sha256(target_puzzle_hash + nonce + user_height)
+                agg_sig_msg = pow_sha256(TARGET_PUZZLEHASH, nonce, mine_height)
+                # Full signed message: msg + coin_id + genesis_challenge
+                coin_id = cr.coin.coin_id()
+                full_msg = agg_sig_msg + coin_id + genesis_challenge
+                sig = sk.sign(full_msg)
+
+                bundle = SpendBundle(
+                    CLVM.coin_spends(),
+                    sig,
+                )
+
+                try:
+                    tx_res = await client.push_tx(bundle)
+                    success = tx_res.success
+                    status_val = getattr(tx_res, "status", None)
+                    error = tx_res.error
+                except Exception as e:
+                    print(f"Failed to push tx: {repr(e)}")
+                    continue
+
+                if success:
+                    submitted_coins[coin_id_key] = mine_height
+                    # Prune stale entries beyond the 3-block window
+                    for k in [k for k, v in submitted_coins.items() if mine_height >= v + 3]:
+                        del submitted_coins[k]
+                    print(
+                        f"Submitted mining spend bundle for height {mine_height}, Status={status_val}"
+                    )
+                else:
+                    print(f"Failed to submit mining spend bundle: {error}")
+            await asyncio.sleep(DEFAULT_SLEEP)
+        except Exception as e:
+            print(f"Error in mining loop: {repr(e)}")
+            await asyncio.sleep(ERROR_SLEEP * (0.5 + random.random()))
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
