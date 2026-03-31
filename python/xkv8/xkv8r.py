@@ -5,10 +5,11 @@ import concurrent.futures
 import hashlib
 import random
 import os
+import pathlib
 import signal
 import sys
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from chia_wallet_sdk import (
     Address,
@@ -39,7 +40,24 @@ _MINER_KEY_HEX = os.environ.get("MINER_SECRET_KEY", "")
 
 THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "1"))
 
+# LOCAL_FULL_NODE: when set to any truthy value (e.g. "1" or "host:port"),
+# a native RPC client using TLS certs is created as the primary client.
+# If the value contains a colon it is treated as host:port; otherwise the
+# default https://localhost:8555 is used.
+LOCAL_FULL_NODE = os.environ.get("LOCAL_FULL_NODE", None)
+
+NETWORK_NAME="mainnet"
+
 TESTNET = os.environ.get("TESTNET", None)
+
+if TESTNET is not None:
+    NETWORK_NAME="testnet11"
+
+# CHIA_ROOT: path to the Chia data directory (default: ~/.chia/mainnet).
+# The full-node TLS certs are read from $CHIA_ROOT/config/ssl/full_node/.
+CHIA_ROOT = pathlib.Path(
+    os.environ.get("CHIA_ROOT", pathlib.Path.home() / ".chia" / NETWORK_NAME)
+)
 
 if TESTNET is None and not TARGET_ADDRESS.startswith("xch"):
     print("Error: TARGET_ADDRESS must be a mainnet address (starting with 'xch')")
@@ -335,15 +353,82 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
         submitted_coins.pop(coin_id, None)
 
 
-async def mine():
-    client = None
-    genesis_challenge = None
-    
+def _load_full_node_certs() -> tuple[bytes, bytes]:
+    """Read the private full-node TLS cert and key from CHIA_ROOT."""
+    ssl_dir = CHIA_ROOT / "config" / "ssl" / "full_node"
+    cert_path = ssl_dir / "private_full_node.crt"
+    key_path = ssl_dir / "private_full_node.key"
+    if not cert_path.exists() or not key_path.exists():
+        print(f"Error: Could not find full-node TLS certs in {ssl_dir}")
+        print("  Ensure your Chia node is set up, or set CHIA_ROOT to the correct directory.")
+        sys.exit(1)
+    return cert_path.read_bytes(), key_path.read_bytes()
+
+
+def build_clients() -> List[RpcClient]:
+    """Build the ordered list of RPC clients.
+
+    * If LOCAL_FULL_NODE is set, an RpcClient using native TLS-authenticated
+      RPC (via RpcClient.local / RpcClient.local_with_url) is placed at
+      index 0 (primary / sync client).
+    * The public coinset endpoint (mainnet or testnet11) is always
+      included as the fallback (or sole) client.
+    """
+    clients: List[RpcClient] = []
+
+    if LOCAL_FULL_NODE is not None:
+        cert_bytes, key_bytes = _load_full_node_certs()
+        # If the value looks like host:port or a full URL, use local_with_url;
+        # otherwise use the default local() which targets https://localhost:8555.
+        if ":" in LOCAL_FULL_NODE:
+            url = LOCAL_FULL_NODE if LOCAL_FULL_NODE.startswith("http") else f"https://{LOCAL_FULL_NODE}"
+            print(f"Using local full node RPC at {url} (native TLS)")
+            clients.append(RpcClient.local_with_url(url, cert_bytes, key_bytes))
+        else:
+            print("Using local full node RPC at https://localhost:8555 (native TLS)")
+            clients.append(RpcClient.local(cert_bytes, key_bytes))
+
     if TESTNET is not None:
-        client = RpcClient.testnet11()
+        clients.append(RpcClient.testnet11())
+    else:
+        clients.append(RpcClient.mainnet())
+
+    return clients
+
+
+async def push_tx_to_all(clients: List[RpcClient], bundle: SpendBundle):
+    """Push a spend bundle to every client concurrently.
+
+    Returns (success, status, error) from the *first* client that succeeds,
+    or the result from the primary (0th) client if none succeed.
+    """
+    async def _push(client: RpcClient):
+        return await client.push_tx(bundle)
+
+    results = await asyncio.gather(*[_push(c) for c in clients], return_exceptions=True)
+
+    # Prefer the first successful result; fall back to the primary client's result
+    primary_result = results[0]
+    for res in results:
+        if isinstance(res, BaseException):
+            continue
+        tx_res = res  # type: ignore[union-attr]
+        if tx_res.success:
+            return tx_res.success, getattr(tx_res, "status", None), tx_res.error
+    # No success – return primary result (may itself be an exception)
+    if isinstance(primary_result, BaseException):
+        raise primary_result
+    tx_primary = primary_result  # type: ignore[union-attr]
+    return tx_primary.success, getattr(tx_primary, "status", None), tx_primary.error
+
+
+async def mine():
+    clients = build_clients()
+    client = clients[0]  # primary client for syncing data
+
+    if TESTNET is not None:
         genesis_challenge = GENESIS_CHALLENGES["testnet11"]
     else:
-        client = RpcClient.mainnet()
         genesis_challenge = GENESIS_CHALLENGES["mainnet"]
 
     #print(f"Genesis challenge: {genesis_challenge.hex()}")
@@ -354,6 +439,8 @@ async def mine():
 
     print(f"Lode puzzle hash: {inner_puzzle_hash.hex()}")
     print(f"Lode full CAT puzzle hash: {full_cat_puzzlehash.hex()}")
+    if THREAD_COUNT > 1:
+        print(f"Mining with up to {THREAD_COUNT} threads for nonce grinding")
     #print(f"CAT TAIL hash:     {CAT_TAIL_HASH.hex()}")
 
     # Load miner key
@@ -385,11 +472,22 @@ async def mine():
                     await check_mining_results(client, inner_puzzle_hash)
 
             # Search for unspent lode coins by puzzle hash
-            unspent_crs = await client.get_coin_records_by_puzzle_hash(
-                full_cat_puzzlehash, None, None, False,
-            )
-            if not unspent_crs.success:
-                print("Failed to discover unspent coins")
+            # (may not be indexed on a local node; fall back through clients)
+            unspent_crs = None
+            for c in clients:
+                try:
+                    res = await c.get_coin_records_by_puzzle_hash(
+                        full_cat_puzzlehash, GENESIS_HEIGHT, height + 5, False,
+                    )
+                    if res.success:
+                        unspent_crs = res
+                        break
+                    else:
+                        print(f"get_coin_records_by_puzzle_hash failed: success=false, error={res.error!r}, coin_records={res.coin_records!r}")
+                except Exception as e:
+                    print(f"get_coin_records_by_puzzle_hash exception: {repr(e)}")
+            if unspent_crs is None or not unspent_crs.success:
+                print("Failed to discover unspent coins on any client")
                 await asyncio.sleep(ERROR_SLEEP * (0.5 + random.random()))
                 continue
 
@@ -401,6 +499,9 @@ async def mine():
                 continue
 
             # Only attempt to mine the largest coin if multiple are found
+            if not unspent_crs.coin_records:
+                continue
+
             largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
             for cr in [largest_cr]:
 
@@ -485,10 +586,7 @@ async def mine():
                 )
 
                 try:
-                    tx_res = await client.push_tx(bundle)
-                    success = tx_res.success
-                    status_val = getattr(tx_res, "status", None)
-                    error = tx_res.error
+                    success, status_val, error = await push_tx_to_all(clients, bundle)
                 except Exception as e:
                     print(f"Failed to push tx: {repr(e)}")
                     continue
