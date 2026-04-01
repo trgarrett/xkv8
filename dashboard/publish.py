@@ -181,9 +181,9 @@ async def get_current_block_height() -> int:
     return blockchain_state.blockchain_state.peak.height
 
 
-async def get_total_mined() -> float:
+async def get_total_mined(current_height: int) -> float:
     unspent_crs = await client.get_coin_records_by_puzzle_hash(
-        FULL_CAT_PUZZLE_HASH, None, None, False,
+        FULL_CAT_PUZZLE_HASH, GENESIS_HEIGHT, current_height + 5, False,
     )
     # Use min() – the *smallest* unspent lode coin is the current chain tip.
     # Orphaned / re-orged coins retain a *larger* amount (less was mined from
@@ -197,7 +197,7 @@ async def fetch_stats(current_block_height: int) -> dict:
     """Return summary statistics for the stats bar."""
     epoch = get_epoch(current_block_height)
     reward = get_reward(epoch)
-    total_mined = await get_total_mined()
+    total_mined = await get_total_mined(current_block_height)
     return {
         "total_mined": _format_number(total_mined),
         "current_block_height": _format_number(current_block_height),
