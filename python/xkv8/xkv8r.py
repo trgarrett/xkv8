@@ -511,7 +511,11 @@ async def mine():
             if not unspent_crs.coin_records:
                 continue
 
-            largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
+            # Prefer the most recently confirmed coin, but avoid coins
+            # whose amount is notably lower than the richest one.
+            max_amount = max(r.coin.amount for r in unspent_crs.coin_records)
+            viable = [r for r in unspent_crs.coin_records if r.coin.amount >= max_amount * 0.9]
+            largest_cr = max(viable, key=lambda r: r.confirmed_block_index)
             for cr in [largest_cr]:
 
                 # Skip if this coin was already submitted within its 3-block validity window
