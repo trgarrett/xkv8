@@ -63,8 +63,12 @@ async def get_total_mined() -> float:
     unspent_crs = await client.get_coin_records_by_puzzle_hash(
         FULL_CAT_PUZZLE_HASH, None, None, False,
     )
-    largest_cr = max(unspent_crs.coin_records, key=lambda r: r.coin.amount)
-    return 21000000.000 - (largest_cr.coin.amount / 1000)
+    # Use min() – the *smallest* unspent lode coin is the current chain tip.
+    # Orphaned / re-orged coins retain a *larger* amount (less was mined from
+    # them), so max() would incorrectly pick a stale fork coin and under-report
+    # the total mined.
+    tip_cr = min(unspent_crs.coin_records, key=lambda r: r.coin.amount)
+    return 21000000.000 - (tip_cr.coin.amount / 1000)
 
 
 def get_epoch(block_height: int) -> int:
