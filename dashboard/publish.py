@@ -231,7 +231,7 @@ async def fetch_dashboard_data(current_height: int) -> tuple[list[dict], list[di
 
     Returns (recent_wins, leaderboard) formatted for the template.
     """
-    cache = await refresh_cache(client)
+    cache = await refresh_cache(client, current_height)
 
     # Recent wins
     recent_wins = format_recent_wins(cache, current_height, count=20)

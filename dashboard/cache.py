@@ -62,11 +62,11 @@ def _load_cache() -> dict:
     return {"coins": {}}
 
 
-async def load_cache(client: RpcClient) -> dict:
+async def load_cache(client: RpcClient, current_height: Optional[int] = None) -> dict:
     """Load the cache from disk; if it contains no coins, refresh from chain."""
     cache = _load_cache()
     if not cache.get("coins"):
-        cache = await refresh_cache(client)
+        cache = await refresh_cache(client, current_height)
     return cache
 
 
@@ -127,7 +127,7 @@ def _extract_user_height(clvm: Clvm, solution_bytes: bytes) -> Optional[int]:
 # Main cache refresh
 # ---------------------------------------------------------------------------
 
-async def refresh_cache(client: RpcClient) -> dict:
+async def refresh_cache(client: RpcClient, current_height: Optional[int] = None) -> dict:
     """
     Refresh the local mine cache and return the full cache dict.
 
@@ -142,13 +142,24 @@ async def refresh_cache(client: RpcClient) -> dict:
       5. Remove any cached coins that no longer appear in the on-chain
          spent set (they were re-orged away).
       6. Save and return the updated cache.
+
+    Parameters:
+      client:         RPC client (local full node or public endpoint).
+      current_height: Current blockchain peak height.  When provided the
+                      coin-record query is bounded to [GENESIS_HEIGHT,
+                      current_height + 5] which is required for the local
+                      full-node RPC.
     """
     cache = _load_cache()
     cached_coins: dict = cache.get("coins", {})
 
-    # Fetch all coin records (spent + unspent) for the lode puzzle hash
+    # Fetch all coin records (spent + unspent) for the lode puzzle hash.
+    # When current_height is known we pass explicit bounds so that the local
+    # full-node RPC (which rejects unbounded queries) succeeds.
+    start_h = GENESIS_HEIGHT if current_height is not None else None
+    end_h = (current_height + 5) if current_height is not None else None
     response = await client.get_coin_records_by_puzzle_hash(
-        FULL_CAT_PUZZLE_HASH, None, None, True,
+        FULL_CAT_PUZZLE_HASH, start_h, end_h, True,
     )
     if not response.success or response.coin_records is None:
         print("[cache] Failed to fetch coin records, using stale cache")
