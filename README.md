@@ -37,6 +37,26 @@ cd python
 MINER_SECRET_KEY="YOUR_CHOSEN_BLS_KEY" TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" python3 -m xkv8.xkv8r
 ```
 
+# Optional Environment Variables
+
+In addition to the required `MINER_SECRET_KEY` and `TARGET_ADDRESS` variables, the miner supports the following optional settings:
+
+| Variable | Default | Description |
+|---|---|---|
+| `THREAD_COUNT` | `1` | Number of threads used for nonce grinding. Increase this to utilise multiple CPU cores and find valid nonces faster. |
+| `LOCAL_FULL_NODE` | *(unset)* | When set, the miner connects to a local Chia full node via TLS-authenticated RPC as the primary client. If the value contains a colon it is treated as `host:port` (e.g. `localhost:8555`); otherwise the default `https://localhost:8555` is used. TLS certificates are read from `$CHIA_ROOT/config/ssl/full_node/`. |
+| `CHIA_ROOT` | `~/.chia/mainnet` | Path to your Chia data directory. Only relevant when `LOCAL_FULL_NODE` is set, as the full-node TLS certs are loaded from here. |
+
+Example using all options:
+
+```
+MINER_SECRET_KEY="YOUR_CHOSEN_BLS_KEY" \
+TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" \
+THREAD_COUNT="4" \
+LOCAL_FULL_NODE="localhost:8555" \
+python3 -m xkv8.xkv8r
+```
+
 # FAQ
 
 1. Q: Why isn't there a release version?

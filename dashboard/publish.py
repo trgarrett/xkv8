@@ -9,27 +9,109 @@ Usage:
     python publish.py                  # Run once
     python publish.py --watch          # Run every 60 seconds
     python publish.py --watch --interval 30  # Run every 30 seconds
+
+Environment variables:
+    TESTNET              – When set, target testnet11 instead of mainnet.
+    LOCAL_FULL_NODE      – When set to any truthy value (e.g. "1" or "host:port"),
+                           a native RPC client using TLS certs is created as the
+                           primary client.  If the value contains a colon it is
+                           treated as host:port; otherwise the default
+                           https://localhost:8555 is used.  Falls back to the
+                           public coinset endpoint when not set.
+    CHIA_ROOT            – Path to the Chia data directory (default:
+                           ~/.chia/mainnet or ~/.chia/testnet11).  The full-node
+                           TLS certs are read from
+                           $CHIA_ROOT/config/ssl/full_node/.
 """
 
 import argparse
 import asyncio
 import os
+import pathlib
 import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 
 from chia_wallet_sdk import RpcClient
 from jinja2 import Environment, FileSystemLoader
 
 from cache import refresh_cache, build_leaderboard, build_recent_wins
 
-if os.environ.get("TESTNET"):
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+TESTNET = os.environ.get("TESTNET", None)
+NETWORK_NAME = "testnet11" if TESTNET is not None else "mainnet"
+
+# LOCAL_FULL_NODE: optional local full-node RPC (see module docstring).
+LOCAL_FULL_NODE = os.environ.get("LOCAL_FULL_NODE", None)
+
+# CHIA_ROOT: path to the Chia data directory; used to locate TLS certs.
+CHIA_ROOT = pathlib.Path(
+    os.environ.get("CHIA_ROOT", pathlib.Path.home() / ".chia" / NETWORK_NAME)
+)
+
+if TESTNET:
     FULL_CAT_PUZZLE_HASH = bytes.fromhex("1a6e78906757f302d0c50b77cad94a59d64298014a5691f50cd19535c61d5d02")
-    client = RpcClient.testnet11()
 else:
     FULL_CAT_PUZZLE_HASH = bytes.fromhex("e758f3dba6baac1a6e581ce46537811157621986e18c350075948049abc479f1")
-    client = RpcClient.mainnet()
+
+# ---------------------------------------------------------------------------
+# Epoch / reward constants (must match clsp/puzzle.clsp curried parameters)
+# ---------------------------------------------------------------------------
+
+GENESIS_HEIGHT = 8_521_888
+EPOCH_LENGTH = 1_120_000  # blocks per epoch (~8 months)
+BASE_REWARD = 10_000  # initial reward per mine in mojos
+
+# ---------------------------------------------------------------------------
+# RPC client (local full node with TLS fallback to public coinset endpoint)
+# ---------------------------------------------------------------------------
+
+
+def _load_full_node_certs() -> Optional[Tuple[bytes, bytes]]:
+    """Read the private full-node TLS cert and key from CHIA_ROOT.
+
+    Returns a (cert, key) tuple, or None if the certs are not found.
+    """
+    ssl_dir = CHIA_ROOT / "config" / "ssl" / "full_node"
+    cert_path = ssl_dir / "private_full_node.crt"
+    key_path = ssl_dir / "private_full_node.key"
+    if not cert_path.exists() or not key_path.exists():
+        print(f"Warning: Could not find full-node TLS certs in {ssl_dir}")
+        print("  Falling back to public RPC endpoint.")
+        return None
+    return cert_path.read_bytes(), key_path.read_bytes()
+
+
+def _build_client() -> RpcClient:
+    """Build an RPC client.
+
+    If LOCAL_FULL_NODE is set and TLS certs are found, a local full-node
+    client is returned.  Otherwise the public coinset endpoint is used.
+    """
+    if LOCAL_FULL_NODE is not None:
+        certs = _load_full_node_certs()
+        if certs is not None:
+            cert_bytes, key_bytes = certs
+            if ":" in LOCAL_FULL_NODE:
+                url = LOCAL_FULL_NODE if LOCAL_FULL_NODE.startswith("http") else f"https://{LOCAL_FULL_NODE}"
+                print(f"Using local full node RPC at {url} (native TLS)")
+                return RpcClient.local_with_url(url, cert_bytes, key_bytes)
+            else:
+                print("Using local full node RPC at https://localhost:8555 (native TLS)")
+                return RpcClient.local(cert_bytes, key_bytes)
+
+    # Fallback: public coinset endpoint
+    if TESTNET:
+        return RpcClient.testnet11()
+    return RpcClient.mainnet()
+
+
+client = _build_client()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,12 +126,52 @@ def _format_number(n) -> str:
     return f"{n:,}"
 
 
+def _format_reward(mojos: int) -> str:
+    """Convert mojos to whole units (÷1000) and format as a float string."""
+    value = mojos / 1000
+    # Show as integer-style float if whole, otherwise up to 3 decimal places
+    if value == int(value):
+        return f"{int(value):,}.0"
+    return f"{value:,.3f}".rstrip("0")
+
+
+def _format_time_ago(spent_height: int, current_height: int) -> str:
+    """Approximate time ago from block height difference (~18.75s per block)."""
+    blocks_ago = current_height - spent_height
+    if blocks_ago < 0:
+        return "just now"
+    seconds = blocks_ago * 18.75
+    if seconds < 60:
+        return "just now"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)} min ago"
+    hours = minutes / 60
+    if hours < 24:
+        if hours < 2:
+            return f"{hours:.1f} hrs ago"
+        return f"{int(hours)} hrs ago"
+    days = hours / 24
+    return f"{int(days)} days ago"
+
+
+def get_epoch(block_height: int) -> int:
+    """Calculate the current epoch (0–3) for a given block height."""
+    if block_height <= GENESIS_HEIGHT:
+        return 0
+    raw = (block_height - GENESIS_HEIGHT) // EPOCH_LENGTH
+    return min(raw, 3)
+
+
+def get_reward(epoch: int) -> int:
+    """Halve reward per epoch: BASE_REWARD >> epoch."""
+    return BASE_REWARD >> epoch
+
+
 # ---------------------------------------------------------------------------
-# Epoch / reward constants (must match clsp/puzzle.clsp curried parameters)
+# Data fetching
 # ---------------------------------------------------------------------------
-GENESIS_HEIGHT = 8_521_888
-EPOCH_LENGTH = 1_120_000  # blocks per epoch (~8 months)
-BASE_REWARD = 10_000  # initial reward per mine in mojos
+
 
 async def get_current_block_height() -> int:
     blockchain_state = await client.get_blockchain_state()
@@ -71,28 +193,6 @@ async def get_total_mined() -> float:
     return 21000000.000 - (tip_cr.coin.amount / 1000)
 
 
-def get_epoch(block_height: int) -> int:
-    """Calculate the current epoch (0–3) for a given block height."""
-    if block_height <= GENESIS_HEIGHT:
-        return 0
-    raw = (block_height - GENESIS_HEIGHT) // EPOCH_LENGTH
-    return min(raw, 3)
-
-
-def get_reward(epoch: int) -> int:
-    """Halve reward per epoch: BASE_REWARD >> epoch."""
-    return BASE_REWARD >> epoch
-
-
-def _format_reward(mojos: int) -> str:
-    """Convert mojos to whole units (÷1000) and format as a float string."""
-    value = mojos / 1000
-    # Show as integer-style float if whole, otherwise up to 3 decimal places
-    if value == int(value):
-        return f"{int(value):,}.0"
-    return f"{value:,.3f}".rstrip("0")
-
-
 async def fetch_stats(current_block_height: int) -> dict:
     """Return summary statistics for the stats bar."""
     epoch = get_epoch(current_block_height)
@@ -104,26 +204,6 @@ async def fetch_stats(current_block_height: int) -> dict:
         "reward_per_block": _format_reward(reward),
         "current_epoch": epoch,
     }
-
-
-def _format_time_ago(spent_height: int, current_height: int) -> str:
-    """Approximate time ago from block height difference (~18.75s per block)."""
-    blocks_ago = current_height - spent_height
-    if blocks_ago < 0:
-        return "just now"
-    seconds = blocks_ago * 18.75
-    if seconds < 60:
-        return "just now"
-    minutes = seconds / 60
-    if minutes < 60:
-        return f"{int(minutes)} min ago"
-    hours = minutes / 60
-    if hours < 24:
-        if hours < 2:
-            return f"{hours:.1f} hrs ago"
-        return f"{int(hours)} hrs ago"
-    days = hours / 24
-    return f"{int(days)} days ago"
 
 
 def format_recent_wins(cache: dict, current_height: int, count: int = 20) -> list[dict]:
