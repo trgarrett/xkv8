@@ -455,9 +455,18 @@ async def mine():
 
     while True:
         try:
-            blockchain_state = await client.get_blockchain_state()
-            if not blockchain_state.success:
-                print("Failed to get blockchain state")
+            blockchain_state = None
+            for c in clients:
+                try:
+                    res = await c.get_blockchain_state()
+                    if res.success:
+                        client = c
+                        blockchain_state = res
+                        break
+                except Exception:
+                    continue
+            if blockchain_state is None:
+                print("Failed to get blockchain state from any client")
                 await asyncio.sleep(ERROR_SLEEP * (0.5 + random.random()))
                 continue
 
