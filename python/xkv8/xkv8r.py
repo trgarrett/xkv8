@@ -79,7 +79,7 @@ elif TESTNET is not None and not TARGET_ADDRESS.startswith("txch"):
     print("Error: TARGET_ADDRESS must be a testnet address (starting with 'txch')")
     sys.exit(1)
 
-DEFAULT_SLEEP=5
+DEFAULT_SLEEP=float(os.environ.get("DEFAULT_SLEEP", "5"))
 ERROR_SLEEP=2
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -633,7 +633,7 @@ async def mine():
                     for c in clients:
                         try:
                             fee_res = await c.get_coin_records_by_puzzle_hash(
-                                fee_puzzlehash, None, None, False,
+                                fee_puzzlehash, GENESIS_HEIGHT, height + 5, False,
                             )
                             if fee_res.success and fee_res.coin_records:
                                 available_coins = [r.coin for r in fee_res.coin_records]
