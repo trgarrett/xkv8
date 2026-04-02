@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import json
 import random
 import os
 import pathlib
@@ -18,9 +19,12 @@ from chia_wallet_sdk import (
     RpcClient,
     Constants,
     SecretKey,
+    Signature,
     Spend,
     SpendBundle,
     cat_puzzle_hash,
+    select_coins,
+    standard_puzzle_hash,
 )
 
 # ── Environment ──────────────────────────────────────────────────────────
@@ -39,6 +43,15 @@ TARGET_PUZZLEHASH = Address.decode(TARGET_ADDRESS).puzzle_hash
 _MINER_KEY_HEX = os.environ.get("MINER_SECRET_KEY", "")
 
 THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "1"))
+
+# FEE_MOJOS: optional fee (in mojos) to attach to each mining spend bundle.
+# When > 0, the miner will look for XCH coins at the standard transaction
+# address derived from MINER_SECRET_KEY and attach a fee coin spend.
+FEE_MOJOS = int(os.environ.get("FEE_MOJOS", "0"))
+
+# DEBUG: set to "1" to log the full JSON representation of every spend
+# bundle (including fee spends) before it is pushed to the network.
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 # LOCAL_FULL_NODE: when set to any truthy value (e.g. "1" or "host:port"),
 # a native RPC client using TLS certs is created as the primary client.
@@ -449,6 +462,20 @@ async def mine():
     pk_bytes = pk.to_bytes()
     print(f"Miner public key: {pk_bytes.hex()}")
     print(f"Mining to address: {TARGET_ADDRESS}")
+
+    # Derive the standard transaction (p2_delegated_puzzle_or_hidden) address
+    # for fee coin management.
+    synthetic_sk = sk.derive_synthetic()
+    synthetic_pk = synthetic_sk.public_key()
+    fee_puzzlehash = standard_puzzle_hash(synthetic_pk)
+    fee_prefix = "txch" if TESTNET is not None else "xch"
+    fee_address = Address(fee_puzzlehash, fee_prefix).encode()
+    if FEE_MOJOS > 0:
+        print(f"Fee mode: {FEE_MOJOS} mojos per spend")
+        print(f"Fee address: {fee_address}")
+        print(f"  → Send XCH to this address to enable fee-boosted mining")
+    else:
+        print(f"Fee address (not active, set FEE_MOJOS to enable): {fee_address}")
     print()
 
     last_height = -1
@@ -593,10 +620,119 @@ async def mine():
                 full_msg = agg_sig_msg + coin_id + genesis_challenge
                 sig = sk.sign(full_msg)
 
+                # ── Optional fee coin attachment ─────────────────────────
+                # If FEE_MOJOS > 0, look for spendable XCH at the standard
+                # transaction address derived from the miner key.  The fee
+                # coin asserts the mining coin's announcement (CREATE_COIN_
+                # ANNOUNCEMENT '$') so the two spends are atomically bound.
+                fee_sig = Signature.infinity()
+                if FEE_MOJOS > 0:
+                    fee_coins_found = False
+                    # Step 1: discover fee coins from any available client
+                    available_coins: list = []
+                    for c in clients:
+                        try:
+                            fee_res = await c.get_coin_records_by_puzzle_hash(
+                                fee_puzzlehash, None, None, False,
+                            )
+                            if fee_res.success and fee_res.coin_records:
+                                available_coins = [r.coin for r in fee_res.coin_records]
+                                break
+                        except Exception as e:
+                            print(f"Fee coin lookup failed on client: {repr(e)}")
+                            continue
+
+                    # Step 2: select coins and build the fee spend
+                    if available_coins:
+                        try:
+                            selected = select_coins(available_coins, FEE_MOJOS)
+                        except Exception as e:
+                            print(f"Fee coin selection failed: {repr(e)}")
+                            selected = []
+
+                        if selected:
+                            try:
+                                fee_coins_found = True
+                                total_in = sum(fc.amount for fc in selected)
+                                change = total_in - FEE_MOJOS
+
+                                # Announcement ID = sha256(mining_coin_id || '$')
+                                announcement_id = hashlib.sha256(
+                                    coin_id + b'$'
+                                ).digest()
+
+                                # Conditions for the primary fee coin
+                                conditions = [
+                                    CLVM.assert_coin_announcement(announcement_id),
+                                    CLVM.reserve_fee(FEE_MOJOS),
+                                ]
+                                if change > 0:
+                                    conditions.append(
+                                        CLVM.create_coin(fee_puzzlehash, change, CLVM.list([CLVM.atom(fee_puzzlehash)]))
+                                    )
+
+                                delegated = CLVM.delegated_spend(conditions)
+                                CLVM.spend_standard_coin(
+                                    selected[0], synthetic_pk, delegated
+                                )
+                                dpuz_hash = delegated.puzzle.tree_hash()
+                                fee_sigs = [
+                                    synthetic_sk.sign(
+                                        dpuz_hash
+                                        + selected[0].coin_id()
+                                        + genesis_challenge
+                                    )
+                                ]
+
+                                # Extra selected coins: empty delegated spend
+                                for extra in selected[1:]:
+                                    empty_del = CLVM.delegated_spend([])
+                                    CLVM.spend_standard_coin(
+                                        extra, synthetic_pk, empty_del
+                                    )
+                                    fee_sigs.append(
+                                        synthetic_sk.sign(
+                                            empty_del.puzzle.tree_hash()
+                                            + extra.coin_id()
+                                            + genesis_challenge
+                                        )
+                                    )
+
+                                fee_sig = Signature.aggregate(fee_sigs)
+                                print(f"Attached fee of {FEE_MOJOS} mojos ({len(selected)} coin(s), change={change})")
+                            except Exception as e:
+                                print(f"Error building fee spend: {repr(e)}")
+                                fee_coins_found = False
+
+                    if not fee_coins_found:
+                        print(
+                            f"Warning: FEE_MOJOS={FEE_MOJOS} but no spendable "
+                            f"coins at {fee_address} – submitting without fee"
+                        )
+
                 bundle = SpendBundle(
                     CLVM.coin_spends(),
-                    sig,
+                    Signature.aggregate([sig, fee_sig]),
                 )
+
+                if DEBUG:
+                    coin_spends_json = []
+                    for cs in bundle.coin_spends:
+                        coin_spends_json.append({
+                            "coin": {
+                                "parent_coin_info": cs.coin.parent_coin_info.hex(),
+                                "puzzle_hash": cs.coin.puzzle_hash.hex(),
+                                "amount": cs.coin.amount,
+                            },
+                            "puzzle_reveal": cs.puzzle_reveal.hex(),
+                            "solution": cs.solution.hex(),
+                        })
+                    bundle_json = {
+                        "coin_spends": coin_spends_json,
+                        "aggregated_signature": bundle.aggregated_signature.to_bytes().hex(),
+                    }
+                    print("[DEBUG] Spend bundle JSON:")
+                    print(json.dumps(bundle_json, indent=2))
 
                 try:
                     success, status_val, error = await push_tx_to_all(clients, bundle)

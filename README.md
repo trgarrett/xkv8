@@ -44,8 +44,10 @@ In addition to the required `MINER_SECRET_KEY` and `TARGET_ADDRESS` variables, t
 | Variable | Default | Description |
 |---|---|---|
 | `THREAD_COUNT` | `1` | Number of threads used for nonce grinding. Increase this to utilise multiple CPU cores and find valid nonces faster. |
+| `FEE_MOJOS` | `0` | Fee in mojos to attach to each mining spend bundle. When greater than 0, the miner looks for spendable XCH coins at the standard transaction address derived from your `MINER_SECRET_KEY` and attaches a fee spend. The fee address is printed at startup — send XCH there to fund fee-boosted mining. If no coins are available, the miner logs a warning and submits without a fee. |
 | `LOCAL_FULL_NODE` | *(unset)* | When set, the miner connects to a local Chia full node via TLS-authenticated RPC as the primary client. If the value contains a colon it is treated as `host:port` (e.g. `localhost:8555`); otherwise the default `https://localhost:8555` is used. TLS certificates are read from `$CHIA_ROOT/config/ssl/full_node/`. |
 | `CHIA_ROOT` | `~/.chia/mainnet` | Path to your Chia data directory. Only relevant when `LOCAL_FULL_NODE` is set, as the full-node TLS certs are loaded from here. |
+| `DEBUG` | `0` | Set to `1` to log the full JSON representation of every spend bundle (including fee spends) before it is pushed to the network. Useful for troubleshooting submission issues. |
 
 Example using all options:
 
@@ -53,7 +55,9 @@ Example using all options:
 MINER_SECRET_KEY="YOUR_CHOSEN_BLS_KEY" \
 TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" \
 THREAD_COUNT="4" \
+FEE_MOJOS="250000" \
 LOCAL_FULL_NODE="localhost:8555" \
+DEBUG="1" \
 python3 -m xkv8.xkv8r
 ```
 
@@ -79,7 +83,7 @@ python3 -m xkv8.xkv8r
 
 4. Q: Can I increase my odds?
    
-   A: First, keep your miner up and running. If block fee pressure becomes a thing, you could choose to inject a fee (some assembly required). Because of Chia's mempool Replace By Fee (RBF) rules, the first fee-paying spend that makes it to the Chia winning farmer will likely be chosen. You can try to buy your luck, but it will only go so far. But Chia farmers would love for you to try anyway!
+   A: First, keep your miner up and running. If block fee pressure becomes a thing, you can attach a fee by setting `FEE_MOJOS` (e.g. `FEE_MOJOS="250000"`). The miner will print a fee address at startup — send some XCH there and the miner will automatically include a fee coin in each spend bundle. Because of Chia's mempool Replace By Fee (RBF) rules, the first fee-paying spend that makes it to the Chia winning farmer will likely be chosen. You can try to buy your luck, but it will only go so far. But Chia farmers would love for you to try anyway!
 
    Whether or not you can mine a winning solution in time is greatly dependent on block propagation, block intervals, mempool propagation, custom mempool implementations, and various other minutiae. Good luck!
 
