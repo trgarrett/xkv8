@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import json
 import random
+import time
 import os
 import pathlib
 import signal
@@ -209,24 +210,53 @@ def get_difficulty(epoch: int) -> int:
     return BASE_DIFFICULTY >> epoch
 
 
+def _compute_prefilter(difficulty: int) -> tuple[int, int, int]:
+    """Compute leading-byte pre-filter parameters for a given difficulty.
+
+    For difficulty = 2^N, a valid hash must have its top (256 - N) bits zero.
+    Returns (n_zero_bytes, check_idx, partial_thresh) where:
+      - n_zero_bytes: number of full leading bytes that must be 0x00
+      - check_idx:    index of the first partial-check byte
+      - partial_thresh: that byte must be < this value (256 means no partial check)
+    """
+    diff_bits = difficulty.bit_length() - 1  # difficulty = 2^diff_bits
+    zero_bits = 256 - diff_bits
+    n_zero_bytes = zero_bits >> 3
+    partial_bits = zero_bits & 7
+    partial_thresh = (1 << (8 - partial_bits)) if partial_bits else 256
+    return n_zero_bytes, n_zero_bytes, partial_thresh
+
+
 def _search_nonce_range(
-    inner_puzzle_hash: bytes,
-    miner_pubkey_bytes: bytes,
-    h_bytes: bytes,
+    prefix_hasher: "hashlib._Hash",
     difficulty: int,
+    n_zero_bytes: int,
+    check_idx: int,
+    partial_thresh: int,
     start: int,
     end: int,
     found_event: threading.Event,
 ) -> Optional[int]:
-    """Search a slice of the nonce space. Returns a valid nonce or None."""
+    """Search a slice of the nonce space. Returns a valid nonce or None.
+
+    Uses a cached SHA-256 prefix and leading-byte pre-filter for speed.
+    """
+    _int_to_clvm = int_to_clvm_bytes
+    _from_bytes = int.from_bytes
     for nonce in range(start, end):
         if found_event.is_set():
             return None
-        n_bytes = int_to_clvm_bytes(nonce)
-        digest = hashlib.sha256(
-            inner_puzzle_hash + miner_pubkey_bytes + h_bytes + n_bytes
-        ).digest()
-        pow_int = int.from_bytes(digest, "big")
+        h = prefix_hasher.copy()
+        h.update(_int_to_clvm(nonce))
+        d = h.digest()
+        # Fast pre-filter: check leading zero bytes (rejects >99.99% of hashes)
+        if d[0]:
+            continue
+        if n_zero_bytes >= 2 and d[1]:
+            continue
+        if partial_thresh < 256 and d[check_idx] >= partial_thresh:
+            continue
+        pow_int = _from_bytes(d, "big")
         if pow_int > 0 and difficulty > pow_int:
             found_event.set()
             return nonce
@@ -240,17 +270,40 @@ def find_valid_nonce(
     difficulty: int,
     max_attempts: int = 5_000_000,
 ) -> Optional[int]:
-    """Grind for a nonce that satisfies the PoW target using up to THREAD_COUNT threads."""
+    """Grind for a nonce that satisfies the PoW target using up to THREAD_COUNT threads.
+
+    Optimizations applied:
+      1. SHA-256 prefix caching — the fixed prefix (puzzle_hash + pubkey + height)
+         is hashed once; each nonce iteration only .copy()s and appends the nonce bytes.
+      2. Leading-byte pre-filter — rejects hashes whose first bytes cannot satisfy
+         the difficulty target, avoiding the expensive int.from_bytes conversion
+         for >99.99% of candidates.
+      3. Local name bindings — avoids repeated global/attribute lookups in the hot loop.
+    """
     h_bytes = int_to_clvm_bytes(user_height)
 
+    # Cache the SHA-256 state after the fixed prefix
+    prefix_hasher = hashlib.sha256(inner_puzzle_hash + miner_pubkey_bytes + h_bytes)
+
+    # Pre-compute leading-byte filter thresholds
+    n_zero_bytes, check_idx, partial_thresh = _compute_prefilter(difficulty)
+
     if THREAD_COUNT <= 1:
-        # Single-threaded fast path
+        # Single-threaded fast path with local name bindings
+        _int_to_clvm = int_to_clvm_bytes
+        _from_bytes = int.from_bytes
         for nonce in range(max_attempts):
-            n_bytes = int_to_clvm_bytes(nonce)
-            digest = hashlib.sha256(
-                inner_puzzle_hash + miner_pubkey_bytes + h_bytes + n_bytes
-            ).digest()
-            pow_int = int.from_bytes(digest, "big")
+            h = prefix_hasher.copy()
+            h.update(_int_to_clvm(nonce))
+            d = h.digest()
+            # Fast pre-filter: leading zero bytes (rejects >99.99% of hashes)
+            if d[0]:
+                continue
+            if n_zero_bytes >= 2 and d[1]:
+                continue
+            if partial_thresh < 256 and d[check_idx] >= partial_thresh:
+                continue
+            pow_int = _from_bytes(d, "big")
             if pow_int > 0 and difficulty > pow_int:
                 return nonce
         return None
@@ -269,10 +322,11 @@ def find_valid_nonce(
             futures.append(
                 executor.submit(
                     _search_nonce_range,
-                    inner_puzzle_hash,
-                    miner_pubkey_bytes,
-                    h_bytes,
+                    prefix_hasher,
                     difficulty,
+                    n_zero_bytes,
+                    check_idx,
+                    partial_thresh,
                     start,
                     end,
                     found_event,
@@ -560,10 +614,13 @@ async def mine():
                     continue
 
                 # Grind for a valid nonce
+                t0 = time.perf_counter()
                 nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
+                elapsed = time.perf_counter() - t0
                 if nonce is None:
-                    print(f"Could not find valid nonce for height {mine_height}")
+                    print(f"Could not find valid nonce for height {mine_height} ({elapsed:.3f}s, threads={THREAD_COUNT})")
                     continue
+                print(f"Nonce found in {elapsed:.3f}s (nonce={nonce}, threads={THREAD_COUNT}, height={mine_height}, epoch={epoch}, difficulty=2^{difficulty.bit_length()-1})")
 
                 #print(f"Found nonce {nonce} for coin {cr.coin.coin_id().hex()} at height {mine_height} (epoch {epoch}, reward {reward}, difficulty 2^{difficulty.bit_length()-1})")
 
