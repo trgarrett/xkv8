@@ -528,7 +528,7 @@ async def mine():
                 continue
 
             # Don't attempt mining before genesis height
-            mine_height = 1 + last_height
+            mine_height = last_height
             if mine_height < GENESIS_HEIGHT:
                 print(f"Waiting for genesis. {GENESIS_HEIGHT - mine_height} blocks to go!")
                 await asyncio.sleep(DEFAULT_SLEEP)
