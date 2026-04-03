@@ -353,12 +353,12 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
  '.......`                   '-.~.~.~.~.~.~.~.~.~.~.~.~- `
 """
                 print(excavator)
-                print(f"Win CONFIRMED at height {sub_height}!")
+                print(f"Win CONFIRMED at height {spent_cr.spent_block_index}!")
                 reward_cat_amount = reward_mojos / 1000
                 print(f"Reward of {reward_cat_amount:.3f} XKV8 sent to {TARGET_ADDRESS}")
                 print()
             else:
-                print(f"Coin submitted at height {sub_height} was mined by another miner")
+                print(f"Coin submitted at height {sub_height} was mined by another miner at height {spent_cr.spent_block_index}")
         except Exception as e:
             to_remove.append(coin_id)
             print(f"Could not verify mining result for {coin_id.hex()[:16]}…: {repr(e)}")
