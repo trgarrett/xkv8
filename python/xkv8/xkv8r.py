@@ -11,7 +11,8 @@ import pathlib
 import signal
 import sys
 import threading
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 from chia_wallet_sdk import (
     Address,
@@ -82,6 +83,11 @@ elif TESTNET is not None and not TARGET_ADDRESS.startswith("txch"):
 
 DEFAULT_SLEEP=float(os.environ.get("DEFAULT_SLEEP", "5"))
 ERROR_SLEEP=2
+
+# LOOKAHEAD_HEIGHTS: how many future heights to pre-compute nonces for.
+# The background precomputer thread grinds nonces for heights
+# current_height .. current_height + LOOKAHEAD_HEIGHTS - 1.
+LOOKAHEAD_HEIGHTS = int(os.environ.get("LOOKAHEAD_HEIGHTS", "50"))
 
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -343,6 +349,123 @@ def find_valid_nonce(
     return None
 
 
+# ── Nonce pre-computation cache ──────────────────────────────────────────
+
+class NonceCache:
+    """Thread-safe cache of pre-computed nonces keyed by blockchain height.
+
+    The PoW hash is ``sha256(inner_puzzle_hash || miner_pubkey || height || nonce)``,
+    which is **independent of coin ID**.  This means nonces can be ground for
+    future heights before a mining challenge even arrives.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cache: Dict[int, int] = {}  # height -> nonce
+        self._current_height: int = -1
+        self._stop_event = threading.Event()
+
+    def get(self, height: int) -> Optional[int]:
+        """Retrieve a pre-computed nonce for *height*, or ``None``."""
+        with self._lock:
+            return self._cache.get(height)
+
+    def put(self, height: int, nonce: int) -> None:
+        """Store a pre-computed nonce for *height*."""
+        with self._lock:
+            self._cache[height] = nonce
+
+    def update_height(self, height: int) -> None:
+        """Advance the current blockchain height and prune stale entries."""
+        with self._lock:
+            self._current_height = height
+            stale = [h for h in self._cache if h < height]
+            for h in stale:
+                del self._cache[h]
+
+    @property
+    def current_height(self) -> int:
+        with self._lock:
+            return self._current_height
+
+    def cached_heights(self) -> set:
+        """Return the set of heights currently in the cache."""
+        with self._lock:
+            return set(self._cache.keys())
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+
+# Singleton shared between the mining loop and the precomputer thread.
+nonce_cache = NonceCache()
+
+
+def nonce_precomputer(
+    inner_puzzle_hash: bytes,
+    miner_pubkey_bytes: bytes,
+    cache: NonceCache,
+) -> None:
+    """Background thread that continuously pre-computes nonces for upcoming heights.
+
+    For each height from ``current_height`` to
+    ``current_height + LOOKAHEAD_HEIGHTS - 1``, grinds a valid nonce and
+    stores it in the shared :class:`NonceCache`.  Heights that are already
+    cached are skipped.
+    """
+    print(f"[Precomputer] Started — pre-computing nonces for {LOOKAHEAD_HEIGHTS} heights ahead")
+
+    while not cache.stopped:
+        base_height = cache.current_height
+        if base_height < GENESIS_HEIGHT:
+            time.sleep(1)
+            continue
+
+        # Determine which heights still need a nonce
+        cached = cache.cached_heights()
+        target_heights = [
+            base_height + offset
+            for offset in range(LOOKAHEAD_HEIGHTS)
+            if (base_height + offset) not in cached
+        ]
+
+        if not target_heights:
+            # Every lookahead height is already cached; wait for new blocks.
+            time.sleep(0.25)
+            continue
+
+        for h in target_heights:
+            if cache.stopped:
+                break
+            # Height may have become stale while we were grinding.
+            if h < cache.current_height:
+                continue
+            # Another pass may have cached it in the meantime.
+            if cache.get(h) is not None:
+                continue
+
+            epoch = get_epoch(h)
+            difficulty = get_difficulty(epoch)
+
+            nonce = find_valid_nonce(
+                inner_puzzle_hash, miner_pubkey_bytes, h, difficulty
+            )
+            if nonce is not None and h >= cache.current_height:
+                cache.put(h, nonce)
+            elif nonce is None:
+                print(f"[Precomputer] Warning: exhausted nonce space for height {h}")
+
+    print("[Precomputer] Stopped")
+
+
 # ── Main mining loop ────────────────────────────────────────────────────
 
 # Known genesis challenges by network name
@@ -407,12 +530,12 @@ async def check_mining_results(client: RpcClient, inner_puzzle_hash: bytes):
  '.......`                   '-.~.~.~.~.~.~.~.~.~.~.~.~- `
 """
                 print(excavator)
-                print(f"Win CONFIRMED at height {sub_height}!")
+                print(f"Win CONFIRMED at height {spent_cr.spent_block_index}!")
                 reward_cat_amount = reward_mojos / 1000
                 print(f"Reward of {reward_cat_amount:.3f} XKV8 sent to {TARGET_ADDRESS}")
                 print()
             else:
-                print(f"Coin submitted at height {sub_height} was mined by another miner")
+                print(f"Coin submitted at height {sub_height} was mined by another miner at height {spent_cr.spent_block_index}")
         except Exception as e:
             to_remove.append(coin_id)
             print(f"Could not verify mining result for {coin_id.hex()[:16]}…: {repr(e)}")
@@ -532,6 +655,18 @@ async def mine():
         print(f"Fee address (not active, set FEE_MOJOS to enable): {fee_address}")
     print()
 
+    # ── Start the nonce precomputer background thread ────────────────
+    precomputer_thread = threading.Thread(
+        target=nonce_precomputer,
+        args=(inner_puzzle_hash, pk_bytes, nonce_cache),
+        daemon=True,
+        name="nonce-precomputer",
+    )
+    precomputer_thread.start()
+    if LOOKAHEAD_HEIGHTS > 0:
+        print(f"Nonce precomputer running (lookahead={LOOKAHEAD_HEIGHTS} heights)")
+    print()
+
     last_height = -1
 
     while True:
@@ -554,8 +689,11 @@ async def mine():
             height = blockchain_state.blockchain_state.peak.height
             if height != last_height:
                 last_height = height
+                # Advance the cache so stale entries are pruned and the
+                # precomputer targets the new range.
+                nonce_cache.update_height(height)
                 if height % 100 == 0:
-                    print(f"Height: {height}")
+                    print(f"Height: {height}  (nonce cache: {nonce_cache.size()} entries)")
 
                 # Check if any previously submitted coins were confirmed
                 if submitted_coins:
@@ -613,16 +751,22 @@ async def mine():
                     print(f"Lode coin amount ({cr.coin.amount}) less than reward ({reward}), skipping")
                     continue
 
-                # Grind for a valid nonce
-                t0 = time.perf_counter()
-                nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
-                elapsed = time.perf_counter() - t0
+                # Try the pre-computed nonce cache first; fall back to
+                # inline grinding if the precomputer hasn't reached this
+                # height yet.
+                nonce = nonce_cache.get(mine_height)
+                if nonce is not None:
+                    nonce_source = "cached"
+                else:
+                    nonce_source = "ground"
+                    nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
+
                 if nonce is None:
                     print(f"Could not find valid nonce for height {mine_height} ({elapsed:.3f}s, threads={THREAD_COUNT})")
                     continue
                 print(f"Nonce found in {elapsed:.3f}s (nonce={nonce}, threads={THREAD_COUNT}, height={mine_height}, epoch={epoch}, difficulty=2^{difficulty.bit_length()-1})")
 
-                #print(f"Found nonce {nonce} for coin {cr.coin.coin_id().hex()} at height {mine_height} (epoch {epoch}, reward {reward}, difficulty 2^{difficulty.bit_length()-1})")
+                #print(f"Found nonce {nonce} ({nonce_source}) for height {mine_height} (epoch {epoch}, reward {reward}, difficulty 2^{difficulty.bit_length()-1})")
 
                 # Get parent spend to reconstruct CAT lineage
                 parent_res = await client.get_coin_record_by_name(cr.coin.parent_coin_info)
@@ -803,7 +947,8 @@ async def mine():
                     for k in [k for k, v in submitted_coins.items() if mine_height >= v + 3]:
                         del submitted_coins[k]
                     print(
-                        f"Submitted mining spend bundle for height {mine_height}, Status={status_val}"
+                        f"Submitted mining spend bundle for height {mine_height}, "
+                        f"Status={status_val} (nonce was {nonce_source})"
                     )
                 else:
                     print(f"Failed to submit mining spend bundle: {error}")
@@ -817,20 +962,24 @@ async def mine():
 
 def main():
     banner = r"""
-__   ___  __      _____   _ __ 
+__   ___  __      _____   _ __
  \ \ / / | \ \    / / _ \ | '__|
-  \ V /| | _\ \  / / (_) || |   
-   > < | |/ /\ \/ / > _ < | |   
-  / . \|   <  \  / | (_) || |   
+  \ V /| | _\ \  / / (_) || |
+   > < | |/ /\ \/ / > _ < | |
+  / . \|   <  \  / | (_) || |
  /_/ \_\_|\_\  \/   \___/ |_|
 """
     print(banner)
     print("Starting miner...")
     signal.signal(signal.SIGINT, sigint_handler)
-    asyncio.run(mine())
+    try:
+        asyncio.run(mine())
+    finally:
+        nonce_cache.stop()
 
 
 def sigint_handler(_, __):
+    nonce_cache.stop()
     print("\nGoodbye!")
     sys.exit(0)
 
