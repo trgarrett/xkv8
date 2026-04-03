@@ -754,12 +754,14 @@ async def mine():
                 # Try the pre-computed nonce cache first; fall back to
                 # inline grinding if the precomputer hasn't reached this
                 # height yet.
+                t0 = time.time()
                 nonce = nonce_cache.get(mine_height)
                 if nonce is not None:
                     nonce_source = "cached"
                 else:
                     nonce_source = "ground"
                     nonce = find_valid_nonce(inner_puzzle_hash, pk_bytes, mine_height, difficulty)
+                elapsed = time.time() - t0
 
                 if nonce is None:
                     print(f"Could not find valid nonce for height {mine_height} ({elapsed:.3f}s, threads={THREAD_COUNT})")
