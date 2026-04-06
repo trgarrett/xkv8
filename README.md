@@ -45,7 +45,8 @@ In addition to the required `MINER_SECRET_KEY` and `TARGET_ADDRESS` variables, t
 |---|---|---|
 | `THREAD_COUNT` | `1` | Number of threads used for nonce grinding. Increase this to utilise multiple CPU cores and find valid nonces faster. |
 | `FEE_MOJOS` | `0` | Fee in mojos to attach to each mining spend bundle. When greater than 0, the miner looks for spendable XCH coins at the standard transaction address derived from your `MINER_SECRET_KEY` and attaches a fee spend. The fee address is printed at startup — send XCH there to fund fee-boosted mining. If no coins are available, the miner logs a warning and submits without a fee. |
-| `LOCAL_FULL_NODE` | *(unset)* | When set, the miner connects to a local Chia full node via TLS-authenticated RPC as the primary client. If the value contains a colon it is treated as `host:port` (e.g. `localhost:8555`); otherwise the default `https://localhost:8555` is used. TLS certificates are read from `$CHIA_ROOT/config/ssl/full_node/`. |
+| `LOCAL_FULL_NODE` | *(unset)* | When set, the miner connects to a local Chia full node via TLS-authenticated RPC as the primary client **and** enables instant-react mining via Peer protocol subscriptions (see below). If the value contains a colon it is treated as `host:port` (e.g. `localhost:8555`); otherwise the default `https://localhost:8555` is used. TLS certificates are read from `$CHIA_ROOT/config/ssl/full_node/`. |
+| `PEER_PORT` | `8444` (`58444` for testnet) | Chia peer protocol port for the instant-react Peer subscription connection. Only used when `LOCAL_FULL_NODE` is set. |
 | `CHIA_ROOT` | `~/.chia/mainnet` | Path to your Chia data directory. Only relevant when `LOCAL_FULL_NODE` is set, as the full-node TLS certs are loaded from here. |
 | `DEBUG` | `0` | Set to `1` to log the full JSON representation of every spend bundle (including fee spends) before it is pushed to the network. Useful for troubleshooting submission issues. |
 
@@ -57,9 +58,23 @@ TARGET_ADDRESS="YOUR_XCH_REWARD_ADDRESS" \
 THREAD_COUNT="4" \
 FEE_MOJOS="250000" \
 LOCAL_FULL_NODE="localhost:8555" \
+PEER_PORT="8444" \
 DEBUG="1" \
 python3 -m xkv8.xkv8r
 ```
+
+# Instant-React Mining (Advanced)
+
+When `LOCAL_FULL_NODE` is set, the miner automatically activates **instant-react mode**. Instead of polling for new blocks every few seconds, it:
+
+1. **Subscribes** to the lode coin puzzle hash via the Chia Peer protocol (port 8444) for real-time block notifications
+2. **Precomputes** the next nonce and pre-signs a spend bundle for the predicted child coin at height+1
+3. **Fires immediately** when a block confirms — pushing the prebuilt bundle to the mempool within milliseconds of the new lode coin appearing on-chain
+4. **Caches** CAT lineage proofs (derived via `Cat.child()` with zero RPC calls) and fee coins (refreshed only on state change events)
+
+If the Peer connection fails, the miner automatically falls back to the standard polling loop.
+
+Without `LOCAL_FULL_NODE`, the miner uses the standard polling loop against the public Coinset API — no changes to that path.
 
 # FAQ
 

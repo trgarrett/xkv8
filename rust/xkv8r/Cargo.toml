@@ -1,0 +1,57 @@
+[package]
+name = "xkv8r"
+version = "0.1.0"
+edition = "2021"
+description = "XKV8 miner — native Rust port using chia-wallet-sdk"
+
+[dependencies]
+# Chia wallet SDK (native Rust, not Python bindings)
+chia-wallet-sdk = { version = "0.33", features = ["native-tls"] }
+
+# Individual chia crates re-exported by the SDK but needed directly
+chia-bls        = { version = "0.36", features = ["serde"] }
+chia-protocol   = { version = "0.36", features = ["serde"] }
+chia-puzzle-types = "0.36"
+chia-puzzles    = "0.20"
+chia-sha2       = "0.36"
+chia-ssl        = "0.36"
+chia-traits     = "0.36"
+chia-consensus  = "0.36"
+
+# CLVM
+clvm-traits = { version = "0.36", features = ["derive", "chia-bls"] }
+clvm-utils  = "0.36"
+clvmr       = "0.16"
+
+# Async / runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# TLS / networking
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+
+# Crypto
+sha2 = "0.10"
+num-bigint = "0.4"
+rand = "0.9"
+
+# Encoding / serialization
+hex = "0.4"
+hex-literal = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async utilities
+async-trait = "0.1"
+
+# Error handling / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = "symbols"
