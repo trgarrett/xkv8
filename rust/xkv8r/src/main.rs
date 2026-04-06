@@ -23,6 +23,13 @@ __   ___  __      _____   _ __
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the rustls CryptoProvider before any TLS operations.
+    // The chia-sdk-client create_rustls_connector() uses aws-lc-rs internally,
+    // so we must install it as the process-level default for rustls 0.23+.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
