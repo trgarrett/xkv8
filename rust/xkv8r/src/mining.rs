@@ -15,8 +15,9 @@ use chia_protocol::{
 use chia_puzzle_types::DeriveSynthetic;
 use chia_puzzle_types::standard::StandardArgs;
 use chia_traits::Streamable;
+use chia_ssl::ChiaCertificate;
 use chia_wallet_sdk::client::{
-    PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
+    PeerOptions, connect_peer, create_rustls_connector,
 };
 use chia_wallet_sdk::driver::{Cat, Puzzle};
 use chia_wallet_sdk::types::{Condition, run_puzzle};
@@ -475,17 +476,11 @@ async fn mine_instant_react(
         .context("Invalid peer address")?;
     println!("Connecting to Chia peer protocol at {socket_addr}…");
 
-    let ssl_dir = config
-        .chia_root
-        .join("config")
-        .join("ssl")
-        .join("full_node");
-    let cert_path = ssl_dir.join("private_full_node.crt");
-    let key_path = ssl_dir.join("private_full_node.key");
-    let cert = load_ssl_cert(
-        cert_path.to_str().unwrap_or(""),
-        key_path.to_str().unwrap_or(""),
-    )?;
+    // Generate a fresh ephemeral client certificate for the peer protocol.
+    // The Chia peer protocol expects connecting clients to present a cert
+    // signed by the embedded Chia CA — NOT the node's own private_full_node cert.
+    let cert = ChiaCertificate::generate()
+        .context("Failed to generate ephemeral TLS certificate for peer connection")?;
     let connector = create_rustls_connector(&cert)?;
     let options = PeerOptions::default();
 
