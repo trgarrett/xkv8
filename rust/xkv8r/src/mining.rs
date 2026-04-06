@@ -147,6 +147,8 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
             }
         }
     } else {
+        println!("Polling mode — checking every {:.0}s", config.default_sleep_secs);
+        println!();
         mine_polling(
             &clients,
             &config,
@@ -245,8 +247,9 @@ async fn poll_once(
     let height = state.peak.height;
 
     if height as i64 != *last_height {
+        let is_first = *last_height < 0;
         *last_height = height as i64;
-        if height % 100 == 0 {
+        if is_first || height % 100 == 0 {
             println!("Height: {height}");
         }
         // Check previously submitted coins
@@ -337,6 +340,9 @@ async fn poll_once(
     }
 
     // Grind for a valid nonce
+    println!(
+        "Grinding nonce at height {mine_height} (epoch={epoch}, reward={reward}, difficulty=2^{difficulty_bits})…"
+    );
     let cancel = Arc::new(AtomicBool::new(false));
     let nonce = find_valid_nonce(
         &inner_puzzle_hash,
@@ -354,6 +360,7 @@ async fn poll_once(
             return Ok(());
         }
     };
+    println!("Found nonce {nonce} — building spend bundle…");
 
     // Get parent spend to reconstruct CAT lineage
     let target_cat = bootstrap_cat_from_coin(clients, &largest_cr.coin, inner_puzzle_hash).await?;
