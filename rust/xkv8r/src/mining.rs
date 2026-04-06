@@ -763,43 +763,10 @@ async fn mine_instant_react(
                     current_height = new_height;
 
                     if let Some(ref pre) = precomputed_bundle {
-                        if new_height >= pre.target_height
-                            && new_height <= pre.target_height + 2
-                        {
-                            // Bundle's validity window is NOW — push it!
-                            println!(
-                                "Height {} reached — pushing precomputed bundle for height {} (nonce={})",
-                                new_height, pre.target_height, pre.nonce
-                            );
-                            let result = push_tx_to_all(clients, &pre.bundle).await;
-                            if result.success {
-                                submitted_coins
-                                    .insert(pre.target_coin_id, pre.target_height);
-                                println!(
-                                    "Submitted precomputed mining spend for height {}, Status={:?}",
-                                    pre.target_height, result.status
-                                );
-                            } else {
-                                eprintln!(
-                                    "Precomputed push failed: {:?} [{}]",
-                                    result.error, result.error_category
-                                );
-                            }
-                            // Precompute next bundle for the next cycle
-                            precomputed_bundle = precompute_bundle(
-                                config,
-                                &current_cat,
-                                current_height,
-                                inner_puzzle_hash,
-                                pk_bytes,
-                                sk,
-                                fee_puzzlehash,
-                                synthetic_sk,
-                                synthetic_pk,
-                                &fee_coins,
-                            );
-                        } else if new_height > pre.target_height + 2 {
-                            // Bundle's 3-block validity window has expired — recompute
+                        if new_height > pre.target_height + 2 {
+                            // Bundle's 3-block validity window [target..target+2] has
+                            // expired without a CoinStateUpdate triggering the push.
+                            // Recompute for the new height.
                             println!(
                                 "Height advanced to {new_height}, precomputed target {} expired (window was {}..{}) — recomputing",
                                 pre.target_height, pre.target_height, pre.target_height + 2
@@ -817,7 +784,8 @@ async fn mine_instant_react(
                                 &fee_coins,
                             );
                         }
-                        // else: new_height < pre.target_height — still waiting, keep bundle
+                        // Otherwise the bundle is still valid — it will be pushed
+                        // when CoinStateUpdate confirms the target coin on-chain.
                     }
 
                     if !submitted_coins.is_empty() {
