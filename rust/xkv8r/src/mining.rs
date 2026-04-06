@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chia_bls::{PublicKey, SecretKey};
@@ -104,6 +104,7 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
     // Dispatch to instant-react or polling
     if config.local_full_node.is_some() {
         println!("⚡ Instant-react mining mode (Peer subscriptions)");
+        let mut reorg_retries = 0u32;
         loop {
             match mine_instant_react(
                 &clients,
@@ -123,9 +124,36 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
                 Err(e) => {
                     let err_str = format!("{e}");
                     if err_str.contains("onnect") || err_str.contains("losed") {
+                        reorg_retries = 0;
                         eprintln!("Peer connection lost: {e}");
                         eprintln!("Reconnecting in 3 seconds…");
                         tokio::time::sleep(Duration::from_secs(3)).await;
+                    } else if err_str.contains("Reorg") {
+                        reorg_retries += 1;
+                        if reorg_retries >= 3 {
+                            eprintln!(
+                                "Peer rejected subscription due to chain reorg {reorg_retries} times — falling back to polling mode"
+                            );
+                            mine_polling(
+                                &clients,
+                                &config,
+                                inner_puzzle_hash,
+                                full_cat_ph,
+                                &pk_bytes,
+                                sk,
+                                fee_puzzlehash,
+                                &fee_address_str,
+                                &synthetic_sk,
+                                &synthetic_pk,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        eprintln!(
+                            "Peer rejected subscription due to chain reorg (attempt {reorg_retries}/3): {e}"
+                        );
+                        eprintln!("Waiting 15 seconds for reorg to settle, then retrying instant-react…");
+                        tokio::time::sleep(Duration::from_secs(15)).await;
                     } else {
                         eprintln!("Instant-react error: {e}");
                         eprintln!("Falling back to polling mode");
@@ -170,6 +198,10 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
 
 // ── Polling-based mining loop ──────────────────────────────────────────
 
+/// Cached spend bundle for a specific (coin_id, height) pair so the polling
+/// loop never grinds the same nonce twice.
+type CachedBundle = Option<(Bytes32, u32, SpendBundle)>;
+
 async fn mine_polling(
     clients: &[Arc<dyn RpcClient>],
     config: &Config,
@@ -184,6 +216,7 @@ async fn mine_polling(
 ) -> Result<()> {
     let mut submitted_coins: SubmittedCoins = HashMap::new();
     let mut last_height: i64 = -1;
+    let mut cached_bundle: CachedBundle = None;
 
     loop {
         match poll_once(
@@ -199,6 +232,7 @@ async fn mine_polling(
             synthetic_pk,
             &mut submitted_coins,
             &mut last_height,
+            &mut cached_bundle,
         )
         .await
         {
@@ -227,6 +261,7 @@ async fn poll_once(
     synthetic_pk: &PublicKey,
     submitted_coins: &mut SubmittedCoins,
     last_height: &mut i64,
+    cached_bundle: &mut CachedBundle,
 ) -> Result<()> {
     // Get blockchain state
     let mut active_client_idx = 0;
@@ -336,17 +371,14 @@ async fn poll_once(
 
     let coin_id_key = largest_cr.coin.coin_id();
 
-    // Skip if already submitted within validity window
-    if let Some(&last_sub) = submitted_coins.get(&coin_id_key) {
-        if mine_height < last_sub + 3 {
-            if config.debug {
-                println!(
-                    "Height {mine_height}: coin {}… already submitted at height {last_sub}, waiting",
-                    &hex::encode(coin_id_key)[..16]
-                );
-            }
-            return Ok(());
+    // Skip entirely if already submitted for this coin
+    if submitted_coins.contains_key(&coin_id_key) {
+        if config.debug {
+            println!(
+                "[debug] Skipping resubmit for coin already submitted at height {mine_height}"
+            );
         }
+        return Ok(());
     }
 
     let epoch = get_epoch(mine_height);
@@ -361,11 +393,93 @@ async fn poll_once(
         return Ok(());
     }
 
-    // Grind for a valid nonce
+    // Reuse cached bundle if coin_id and height match, otherwise grind fresh
+    let use_cache = matches!(cached_bundle, Some((cid, ch, _)) if *cid == coin_id_key && *ch == mine_height);
+    let bundle = if use_cache {
+        if config.debug {
+            println!("[debug] Reusing cached bundle for height {mine_height}");
+        }
+        cached_bundle.as_ref().unwrap().2.clone()
+    } else {
+        build_polling_bundle(
+            clients,
+            config,
+            &largest_cr.coin,
+            inner_puzzle_hash,
+            full_cat_ph,
+            pk_bytes,
+            sk,
+            fee_puzzlehash,
+            synthetic_sk,
+            synthetic_pk,
+            mine_height,
+            difficulty_bits,
+            epoch,
+            reward,
+            cached_bundle,
+            coin_id_key,
+        )
+        .await?
+    };
+
+    let result = push_tx_to_all(clients, &bundle).await;
+    if result.success {
+        submitted_coins.insert(coin_id_key, mine_height);
+        // Prune stale entries
+        submitted_coins.retain(|_, v| mine_height < *v + 3);
+        println!(
+            "Submitted mining spend bundle for height {mine_height}, Status={:?}",
+            result.status
+        );
+    } else {
+        match result.error_category {
+            "transport" => eprintln!("Failed to push tx (transport error): {:?}", result.error),
+            "mempool_conflict" => {
+                if config.debug {
+                    println!(
+                        "[debug] Submit skipped (already in mempool) for height {mine_height}: {:?}",
+                        result.error
+                    );
+                }
+            }
+            cat => eprintln!(
+                "Failed to submit mining spend bundle: {:?} [{cat}]",
+                result.error
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+// ── Polling bundle builder (grind nonce + build, then cache) ──────────
+
+#[allow(clippy::too_many_arguments)]
+async fn build_polling_bundle(
+    clients: &[Arc<dyn RpcClient>],
+    config: &Config,
+    coin: &chia_protocol::Coin,
+    inner_puzzle_hash: Bytes32,
+    full_cat_ph: Bytes32,
+    pk_bytes: &[u8; 48],
+    sk: &SecretKey,
+    fee_puzzlehash: Bytes32,
+    synthetic_sk: &SecretKey,
+    synthetic_pk: &PublicKey,
+    mine_height: u32,
+    difficulty_bits: u32,
+    epoch: u32,
+    reward: u64,
+    cached_bundle: &mut CachedBundle,
+    coin_id_key: Bytes32,
+) -> Result<SpendBundle> {
+    let _ = (full_cat_ph, epoch, reward); // used by caller for guards already
+
     println!(
         "Grinding nonce at height {mine_height} (epoch={epoch}, reward={reward}, difficulty=2^{difficulty_bits})…"
     );
     let cancel = Arc::new(AtomicBool::new(false));
+    let grind_start = Instant::now();
     let nonce = find_valid_nonce(
         &inner_puzzle_hash,
         pk_bytes,
@@ -378,26 +492,21 @@ async fn poll_once(
     let nonce = match nonce {
         Some(n) => n,
         None => {
-            eprintln!("Could not find valid nonce for height {mine_height}");
-            return Ok(());
+            anyhow::bail!("Could not find valid nonce for height {mine_height}");
         }
     };
-    println!("Found nonce {nonce} — building spend bundle…");
+    println!("Found nonce {nonce} in {:.2?} — building spend bundle…", grind_start.elapsed());
 
-    // Get parent spend to reconstruct CAT lineage
-    let target_cat = bootstrap_cat_from_coin(clients, &largest_cr.coin, inner_puzzle_hash).await?;
-
+    let target_cat = bootstrap_cat_from_coin(clients, coin, inner_puzzle_hash).await?;
     let target_cat = match target_cat {
         Some(c) => c,
         None => {
-            eprintln!("Could not reconstruct CAT lineage for coin");
-            return Ok(());
+            anyhow::bail!("Could not reconstruct CAT lineage for coin");
         }
     };
 
-    // Fetch fee coins if needed
     let fee_coins = if config.fee_mojos > 0 {
-        fetch_fee_coins(clients, fee_puzzlehash, height).await
+        fetch_fee_coins(clients, fee_puzzlehash, mine_height).await
     } else {
         Vec::new()
     };
@@ -416,27 +525,10 @@ async fn poll_once(
         synthetic_pk,
     )?;
 
-    let result = push_tx_to_all(clients, &bundle).await;
-    if result.success {
-        submitted_coins.insert(coin_id_key, mine_height);
-        // Prune stale entries
-        submitted_coins.retain(|_, v| mine_height < *v + 3);
-        println!(
-            "Submitted mining spend bundle for height {mine_height}, Status={:?}",
-            result.status
-        );
-    } else {
-        match result.error_category {
-            "transport" => eprintln!("Failed to push tx (transport error): {:?}", result.error),
-            "mempool_conflict" => eprintln!("Mempool conflict: {:?}", result.error),
-            cat => eprintln!(
-                "Failed to submit mining spend bundle: {:?} [{cat}]",
-                result.error
-            ),
-        }
-    }
+    // Cache for subsequent polls at the same (coin_id, height)
+    *cached_bundle = Some((coin_id_key, mine_height, bundle.clone()));
 
-    Ok(())
+    Ok(bundle)
 }
 
 // ── Instant-react mining (LOCAL_FULL_NODE only) ────────────────────────
@@ -525,7 +617,7 @@ async fn mine_instant_react(
         puzzle_hashes.push(fee_puzzlehash);
     }
 
-    let _resp = peer
+    let sub_resp = peer
         .request_puzzle_state(
             puzzle_hashes.clone(),
             Some(height.saturating_sub(10)),
@@ -533,12 +625,34 @@ async fn mine_instant_react(
             filters,
             true,
         )
-        .await?;
+        .await;
     println!(
         "Subscribed to {} puzzle hash(es) (lode{})",
         puzzle_hashes.len(),
         if config.fee_mojos > 0 { " + fee" } else { "" }
     );
+    println!("  lode full_cat_ph = {}", hex::encode(full_cat_ph));
+    match sub_resp {
+        Ok(Ok(respond)) => {
+            println!(
+                "  subscription response: is_finished={}, {} coin_states",
+                respond.is_finished,
+                respond.coin_states.len(),
+            );
+            if respond.is_finished {
+                eprintln!(
+                    "Warning: peer returned is_finished=true — subscription may not be active. \
+                     The node may not support live puzzle-hash subscriptions on this port/version."
+                );
+            }
+        }
+        Ok(Err(reject)) => {
+            anyhow::bail!("Peer rejected puzzle state subscription: {:?}", reject);
+        }
+        Err(e) => {
+            anyhow::bail!("Peer request_puzzle_state transport error: {e}");
+        }
+    }
 
     // Start precomputing first bundle
     let mut precomputed_bundle: Option<PrecomputedBundle> = precompute_bundle(
@@ -572,8 +686,36 @@ async fn mine_instant_react(
                 let update = CoinStateUpdate::from_bytes(&msg.data)?;
                 let update_height = update.height;
 
+                if config.debug {
+                    println!(
+                        "[debug] CoinStateUpdate at height {update_height}: {} item(s)",
+                        update.items.len()
+                    );
+                }
+
                 for coin_state in &update.items {
                     let coin = &coin_state.coin;
+
+                    if config.debug {
+                        println!(
+                            "[debug]   coin_id={} ph={} created={:?} spent={:?}",
+                            hex::encode(coin.coin_id()),
+                            hex::encode(coin.puzzle_hash),
+                            coin_state.created_height,
+                            coin_state.spent_height,
+                        );
+                        if coin.puzzle_hash == full_cat_ph {
+                            if let Some(ref pre) = precomputed_bundle {
+                                println!(
+                                    "[debug]   → lode coin! precomputed target_coin={} match={}",
+                                    hex::encode(pre.target_coin_id),
+                                    pre.target_coin_id == coin.coin_id(),
+                                );
+                            } else {
+                                println!("[debug]   → lode coin! no precomputed bundle");
+                            }
+                        }
+                    }
 
                     // ── Lode coin events ─────────────────────────
                     if coin.puzzle_hash == full_cat_ph {
@@ -651,6 +793,7 @@ async fn mine_instant_react(
                                             let pkb = *pk_bytes;
                                             let cancel2 = cancel.clone();
                                             let tc = config.thread_count;
+                                            let grind_start = Instant::now();
                                             let nonce = tokio::task::spawn_blocking(move || {
                                                 find_valid_nonce(
                                                     &iph,
@@ -665,6 +808,7 @@ async fn mine_instant_react(
                                             .await?;
 
                                             if let Some(nonce) = nonce {
+                                                println!("Found nonce {nonce} in {:.2?} — building spend bundle…", grind_start.elapsed());
                                                 match build_mining_bundle(
                                                     config,
                                                     &fresh_cat,
@@ -762,6 +906,17 @@ async fn mine_instant_react(
                     }
                     current_height = new_height;
 
+                    if config.debug {
+                        match &precomputed_bundle {
+                            Some(pre) => println!(
+                                "[debug] NewPeak {new_height}: precomputed bundle target_height={} target_coin={}…",
+                                pre.target_height,
+                                &hex::encode(pre.target_coin_id)[..16],
+                            ),
+                            None => println!("[debug] NewPeak {new_height}: no precomputed bundle"),
+                        }
+                    }
+
                     if let Some(ref pre) = precomputed_bundle {
                         if new_height > pre.target_height + 2 {
                             // Bundle's 3-block validity window [target..target+2] has
@@ -800,7 +955,11 @@ async fn mine_instant_react(
                     }
                 }
             }
-            _ => {} // Ignore other message types
+            _ => {
+                if config.debug {
+                    println!("[debug] Unhandled peer message type: {:?}", msg.msg_type);
+                }
+            }
         }
     }
 }
@@ -848,6 +1007,7 @@ fn precompute_bundle(
     let future_cat = cat.child(inner_puzzle_hash, child_amount);
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let grind_start = Instant::now();
     let nonce = find_valid_nonce(
         &inner_puzzle_hash,
         pk_bytes,
@@ -857,6 +1017,7 @@ fn precompute_bundle(
         config.thread_count,
         cancel,
     )?;
+    println!("Found nonce {nonce} in {:.2?} (precomputed for height {future_height})", grind_start.elapsed());
 
     let bundle = build_mining_bundle(
         config,
