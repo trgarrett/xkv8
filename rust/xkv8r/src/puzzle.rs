@@ -11,6 +11,19 @@ use clvmr::{
     serde::node_from_bytes,
 };
 
+/// Build a single curry arg node: `(c (q . val) rest)` = `(4 (1 . val) rest)`.
+///
+/// This matches the CLVM currying convention that the Python `.curry()` uses.
+fn curry_node(a: &mut Allocator, val: NodePtr, rest: NodePtr) -> Result<NodePtr> {
+    // (1 . val) — the quote operator applied to val
+    let quoted = a.new_pair(a.one(), val)?;
+    // Build list (4 (1 . val) rest) as (4 . ((1 . val) . (rest . ())))
+    let c_op = a.new_atom(&[4])?;
+    let tail = a.new_pair(rest, a.nil())?;
+    let inner = a.new_pair(quoted, tail)?;
+    Ok(a.new_pair(c_op, inner)?)
+}
+
 use crate::config::{BASE_DIFFICULTY_BITS, BASE_REWARD, CAT_TAIL_HASH, EPOCH_LENGTH, GENESIS_HEIGHT};
 
 /// Compiled puzzle hex (puzzle.clsp) — public so bundle.rs can re-use it.
@@ -81,21 +94,24 @@ pub fn build_curried_puzzle_hash() -> Result<Bytes32> {
     let diff_bytes = base_difficulty.to_bytes_be();
     let base_difficulty_atom = allocator.new_atom(&diff_bytes)?;
 
-    // Build curry args: (arg1 arg2 ... argN . 1)
+    // Build curry args in the standard CLVM currying form:
+    //   (c (q . arg1) (c (q . arg2) ... (c (q . argN) 1) ...))
     let one = allocator.one();
-    let args = allocator.new_pair(base_difficulty_atom, one)?;
-    let args = allocator.new_pair(base_reward_atom, args)?;
-    let args = allocator.new_pair(epoch_length_atom, args)?;
-    let args = allocator.new_pair(genesis_height_atom, args)?;
-    let args = allocator.new_pair(tail_hash_atom, args)?;
-    let args = allocator.new_pair(cat_mod_hash_atom, args)?;
-    let args = allocator.new_pair(mod_hash_atom, args)?;
+    let args = curry_node(&mut allocator, base_difficulty_atom, one)?;
+    let args = curry_node(&mut allocator, base_reward_atom, args)?;
+    let args = curry_node(&mut allocator, epoch_length_atom, args)?;
+    let args = curry_node(&mut allocator, genesis_height_atom, args)?;
+    let args = curry_node(&mut allocator, tail_hash_atom, args)?;
+    let args = curry_node(&mut allocator, cat_mod_hash_atom, args)?;
+    let args = curry_node(&mut allocator, mod_hash_atom, args)?;
 
-    let curried_ptr = CurriedProgram {
-        program: mod_ptr,
-        args,
-    }
-    .to_clvm(&mut allocator)?;
+    // Build (a (q . program) args) = (2 (1 . program) . (args . ()))
+    // We skip CurriedProgram because it would re-wrap our pre-built curry chain.
+    let quoted_mod = allocator.new_pair(allocator.one(), mod_ptr)?;
+    let apply_op = allocator.new_atom(&[2])?;
+    let rest = allocator.new_pair(args, allocator.nil())?;
+    let inner = allocator.new_pair(quoted_mod, rest)?;
+    let curried_ptr = allocator.new_pair(apply_op, inner)?;
 
     let inner_puzzle_hash: Bytes32 = tree_hash(&allocator, curried_ptr).into();
     Ok(inner_puzzle_hash)
@@ -122,25 +138,42 @@ pub fn build_curried_puzzle_in_ctx(ctx: &mut SpendContext) -> Result<NodePtr> {
     let diff_bytes = base_difficulty.to_bytes_be();
     let base_difficulty_atom = ctx.new_atom(&diff_bytes)?;
 
+    // Build curry args in the standard CLVM currying form:
+    //   (c (q . arg1) (c (q . arg2) ... (c (q . argN) 1) ...))
     let one = ctx.one();
-    let args = ctx.new_pair(base_difficulty_atom, one)?;
-    let args = ctx.new_pair(base_reward_atom, args)?;
-    let args = ctx.new_pair(epoch_length_atom, args)?;
-    let args = ctx.new_pair(genesis_height_atom, args)?;
-    let args = ctx.new_pair(tail_hash_atom, args)?;
-    let args = ctx.new_pair(cat_mod_hash_atom, args)?;
-    let args = ctx.new_pair(mod_hash_atom, args)?;
+    let args = curry_node_ctx(ctx, base_difficulty_atom, one)?;
+    let args = curry_node_ctx(ctx, base_reward_atom, args)?;
+    let args = curry_node_ctx(ctx, epoch_length_atom, args)?;
+    let args = curry_node_ctx(ctx, genesis_height_atom, args)?;
+    let args = curry_node_ctx(ctx, tail_hash_atom, args)?;
+    let args = curry_node_ctx(ctx, cat_mod_hash_atom, args)?;
+    let args = curry_node_ctx(ctx, mod_hash_atom, args)?;
 
-    let curried_ptr = CurriedProgram {
-        program: mod_ptr,
-        args,
-    }
-    .to_clvm(&mut **ctx)?;
+    // Build (a (q . program) args) = (2 (1 . program) . (args . ()))
+    let one_node = ctx.one();
+    let nil = ctx.nil();
+    let quoted_mod = ctx.new_pair(one_node, mod_ptr)?;
+    let apply_op = ctx.new_atom(&[2])?;
+    let rest = ctx.new_pair(args, nil)?;
+    let inner = ctx.new_pair(quoted_mod, rest)?;
+    let curried_ptr = ctx.new_pair(apply_op, inner)?;
 
     Ok(curried_ptr)
 }
 
 use chia_wallet_sdk::driver::SpendContext;
+
+/// Same as `curry_node` but operates on a `SpendContext` (which DerefMut → Allocator).
+fn curry_node_ctx(ctx: &mut SpendContext, val: NodePtr, rest: NodePtr) -> Result<NodePtr> {
+    // SpendContext derefs to Allocator, so same logic applies
+    let one = ctx.one();
+    let nil = ctx.nil();
+    let quoted = ctx.new_pair(one, val)?;
+    let c_op = ctx.new_atom(&[4])?;
+    let tail = ctx.new_pair(rest, nil)?;
+    let inner = ctx.new_pair(quoted, tail)?;
+    Ok(ctx.new_pair(c_op, inner)?)
+}
 
 /// Compute the full CAT puzzle hash for the given inner puzzle hash.
 pub fn full_cat_puzzlehash(inner_puzzle_hash: Bytes32) -> Bytes32 {
