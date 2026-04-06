@@ -16,7 +16,7 @@ use chia_puzzle_types::DeriveSynthetic;
 use chia_puzzle_types::standard::StandardArgs;
 use chia_traits::Streamable;
 use chia_wallet_sdk::client::{
-    PeerOptions, connect_peer, create_native_tls_connector, load_ssl_cert,
+    PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
 };
 use chia_wallet_sdk::driver::{Cat, Puzzle};
 use chia_wallet_sdk::types::{Condition, run_puzzle};
@@ -486,7 +486,7 @@ async fn mine_instant_react(
         cert_path.to_str().unwrap_or(""),
         key_path.to_str().unwrap_or(""),
     )?;
-    let connector = create_native_tls_connector(&cert)?;
+    let connector = create_rustls_connector(&cert)?;
     let options = PeerOptions::default();
 
     let (peer, mut receiver) =

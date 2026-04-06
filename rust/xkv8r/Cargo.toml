@@ -6,7 +6,7 @@ description = "XKV8 miner — native Rust port using chia-wallet-sdk"
 
 [dependencies]
 # Chia wallet SDK (native Rust, not Python bindings)
-chia-wallet-sdk = { version = "0.33", features = ["native-tls"] }
+chia-wallet-sdk = { version = "0.33", features = ["native-tls", "rustls"] }
 
 # Individual chia crates re-exported by the SDK but needed directly
 chia-bls        = { version = "0.36", features = ["serde"] }
