@@ -246,7 +246,8 @@ async fn poll_once(
         .context("No blockchain_state in response")?;
     let height = state.peak.height;
 
-    if height as i64 != *last_height {
+    let new_height = height as i64 != *last_height;
+    if new_height {
         let is_first = *last_height < 0;
         *last_height = height as i64;
         if is_first || height % 100 == 0 {
@@ -295,7 +296,21 @@ async fn poll_once(
     let records = unspent_records.context("Failed to discover unspent coins on any client")?;
     let coin_records = records.coin_records.unwrap_or_default();
     if coin_records.is_empty() {
+        if new_height && (config.debug || height % 50 == 0) {
+            println!(
+                "Height {height}: no unspent lode coins found (cat_ph={}…)",
+                &hex::encode(full_cat_ph)[..16]
+            );
+        }
         return Ok(());
+    }
+
+    if config.debug {
+        println!(
+            "Height {height}: found {} unspent lode coin(s), best amount={}",
+            coin_records.len(),
+            coin_records.iter().map(|r| r.coin.amount).max().unwrap_or(0)
+        );
     }
 
     let mine_height = height;
@@ -323,6 +338,12 @@ async fn poll_once(
     // Skip if already submitted within validity window
     if let Some(&last_sub) = submitted_coins.get(&coin_id_key) {
         if mine_height < last_sub + 3 {
+            if config.debug {
+                println!(
+                    "Height {mine_height}: coin {}… already submitted at height {last_sub}, waiting",
+                    &hex::encode(coin_id_key)[..16]
+                );
+            }
             return Ok(());
         }
     }
@@ -666,6 +687,8 @@ async fn mine_instant_react(
                                                         let result =
                                                             push_tx_to_all(clients, &bundle).await;
                                                         if result.success {
+                                                            submitted_coins
+                                                                .insert(coin.coin_id(), fresh_height);
                                                             println!("Submitted fresh mining spend for height {fresh_height}, Status={:?}", result.status);
                                                         } else {
                                                             eprintln!("Fresh push failed: {:?} [{}]", result.error, result.error_category);
