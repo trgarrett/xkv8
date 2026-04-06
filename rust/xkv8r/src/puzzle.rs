@@ -5,7 +5,7 @@ use chia_protocol::Bytes32;
 use chia_puzzle_types::cat::CatArgs;
 use chia_wallet_sdk::types::Mod;
 use clvm_traits::ToClvm;
-use clvm_utils::{CurriedProgram, TreeHash, tree_hash};
+use clvm_utils::{TreeHash, tree_hash};
 use clvmr::{
     Allocator, NodePtr,
     serde::node_from_bytes,
@@ -107,9 +107,11 @@ pub fn build_curried_puzzle_hash() -> Result<Bytes32> {
 
     // Build (a (q . program) args) = (2 (1 . program) . (args . ()))
     // We skip CurriedProgram because it would re-wrap our pre-built curry chain.
-    let quoted_mod = allocator.new_pair(allocator.one(), mod_ptr)?;
+    let one_node = allocator.one();
+    let nil_node = allocator.nil();
+    let quoted_mod = allocator.new_pair(one_node, mod_ptr)?;
     let apply_op = allocator.new_atom(&[2])?;
-    let rest = allocator.new_pair(args, allocator.nil())?;
+    let rest = allocator.new_pair(args, nil_node)?;
     let inner = allocator.new_pair(quoted_mod, rest)?;
     let curried_ptr = allocator.new_pair(apply_op, inner)?;
 
