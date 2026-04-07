@@ -1080,7 +1080,8 @@ async fn mine_instant_react(
 
                         if let Some((bundle, target_height, nonce)) = best {
                             println!(
-                                "NewPeak {new_height}: firing precomputed bundle for current lode coin (target_height={target_height}, nonce={nonce})"
+                                "NewPeak {new_height}: firing precomputed bundle for current lode coin (coin_id={}, target_height={target_height}, nonce={nonce})",
+                                hex::encode(current_coin_id)
                             );
                             let label = format!("NewPeak h={new_height} target={target_height}");
                             let result = push_tx_with_retry(clients, &bundle, &label, config.debug).await;
