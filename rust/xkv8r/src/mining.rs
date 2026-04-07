@@ -433,7 +433,12 @@ async fn poll_once(
         );
     } else {
         match result.error_category {
-            "transport" => eprintln!("Failed to push tx (transport error): {:?}", result.error),
+            "transport" => {
+                eprintln!("Failed to push tx (transport error): {:?}", result.error);
+                for (i, summary) in &result.per_client_errors {
+                    eprintln!("  client[{i}]: {summary}");
+                }
+            }
             "mempool_conflict" => {
                 if config.debug {
                     println!(
@@ -769,6 +774,11 @@ async fn mine_instant_react(
                                         "Precomputed push failed: {:?} [{}]",
                                         result.error, result.error_category
                                     );
+                                    if result.error_category == "transport" {
+                                        for (i, summary) in &result.per_client_errors {
+                                            eprintln!("  client[{i}]: {summary}");
+                                        }
+                                    }
                                 }
                             } else {
                                 // Nothing in grid matches — build fresh
@@ -852,6 +862,11 @@ async fn mine_instant_react(
                                                         println!("Submitted fresh mining spend for height {fresh_height}, Status={:?}", result.status);
                                                     } else {
                                                         eprintln!("Fresh push failed: {:?} [{}]", result.error, result.error_category);
+                                                        if result.error_category == "transport" {
+                                                            for (i, summary) in &result.per_client_errors {
+                                                                eprintln!("  client[{i}]: {summary}");
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
@@ -999,6 +1014,9 @@ async fn mine_instant_react(
                                                 "Warning: transport error pushing bundle (will retry next block): {:?}",
                                                 result.error
                                             );
+                                            for (i, summary) in &result.per_client_errors {
+                                                eprintln!("  client[{i}]: {summary}");
+                                            }
                                         }
                                         cat => eprintln!(
                                             "NewPeak fire failed: {:?} [{cat}]",
