@@ -228,7 +228,7 @@ pub fn build_clients(config: &Config) -> Result<Vec<Arc<dyn RpcClient>>> {
 // ── Push TX helpers ────────────────────────────────────────────────────
 
 /// Structured result from pushing a transaction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PushTxResult {
     pub success: bool,
     pub status: Option<String>,

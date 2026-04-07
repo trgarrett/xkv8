@@ -37,9 +37,9 @@ use crate::puzzle::{
 const ERROR_SLEEP_SECS: f64 = 2.0;
 const MAX_NONCE_ATTEMPTS: u64 = 5_000_000;
 /// How long to wait between coin_not_ready retries (seconds).
-const COIN_NOT_READY_RETRY_SECS: f64 = 0.25;
+const COIN_NOT_READY_RETRY_SECS: f64 = 0.1;
 /// Maximum number of coin_not_ready retries before giving up on a push attempt.
-const COIN_NOT_READY_MAX_RETRIES: u32 = 5;
+const COIN_NOT_READY_MAX_RETRIES: u32 = 15;
 
 const EXCAVATOR_ART: &str = r#"
   .-.
@@ -220,6 +220,14 @@ async fn push_tx_with_retry(
     debug: bool,
 ) -> crate::client::PushTxResult {
     let mut result = push_tx_to_all(clients, bundle).await;
+    // Track the best (most recent success) result seen across all attempts so
+    // that a transport error on a *retry* never clobbers an earlier success.
+    let mut best_result: Option<crate::client::PushTxResult> = if result.success {
+        Some(result.clone())
+    } else {
+        None
+    };
+
     for attempt in 1..=COIN_NOT_READY_MAX_RETRIES {
         let is_pending = result.success
             && result.status.as_deref().map(|s| s.eq_ignore_ascii_case("pending")).unwrap_or(false);
@@ -241,8 +249,38 @@ async fn push_tx_with_retry(
         }
         tokio::time::sleep(Duration::from_secs_f64(COIN_NOT_READY_RETRY_SECS)).await;
         result = push_tx_to_all(clients, bundle).await;
+
+        if result.success {
+            best_result = Some(result.clone());
+        }
+
+        // If a retry itself returns a transport error, log it immediately and
+        // stop retrying — hammering further will not help and obscures the real
+        // state.  We will return `best_result` below if we had an earlier success.
+        if !result.success && result.error_category == "transport" {
+            let is_decode_err = result
+                .error
+                .as_deref()
+                .map_or(false, |e| e.contains("error decoding response body"));
+            eprintln!(
+                "{label}: transport error on retry attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}: {:?}",
+                result.error
+            );
+            if is_decode_err {
+                eprintln!(
+                    "  note: 'error decoding response body' often means the node returned a \
+                     non-JSON response (rate-limit, HTML error page, or already-in-mempool rejection)"
+                );
+            }
+            for (i, summary) in &result.per_client_errors {
+                eprintln!("  client[{i}]: {summary}");
+            }
+            break;
+        }
     }
-    result
+
+    // Return the best successful result seen, or the final result if nothing succeeded.
+    best_result.unwrap_or(result)
 }
 
 async fn mine_polling(
@@ -378,7 +416,7 @@ async fn poll_once(
         if new_height && (config.debug || height % 50 == 0) {
             println!(
                 "Height {height}: no unspent lode coins found (cat_ph={}…)",
-                &hex::encode(full_cat_ph)[..16]
+                &hex::encode(full_cat_ph)
             );
         }
         return Ok(());
@@ -477,7 +515,11 @@ async fn poll_once(
     } else {
         match result.error_category {
             "transport" => {
-                eprintln!("Failed to push tx (transport error): {:?}", result.error);
+                eprintln!(
+                    "Failed to push tx (transport error) for coin {} at height {mine_height}: {:?}",
+                    hex::encode(coin_id_key),
+                    result.error
+                );
                 for (i, summary) in &result.per_client_errors {
                     eprintln!("  client[{i}]: {summary}");
                 }
@@ -634,7 +676,7 @@ async fn mine_instant_react(
     let initial_cat = initial_cat.context("Failed to bootstrap initial Cat object")?;
     println!(
         "Bootstrapped Cat: coin_id={}…, amount={}",
-        &hex::encode(initial_cat.coin.coin_id())[..16],
+        &hex::encode(initial_cat.coin.coin_id()),
         initial_cat.coin.amount
     );
 
@@ -779,7 +821,7 @@ async fn mine_instant_react(
                             println!(
                                 "New lode coin confirmed at height {:?}: coin_id={}…, amount={}",
                                 coin_state.created_height,
-                                &hex::encode(coin.coin_id())[..16],
+                                &hex::encode(coin.coin_id()),
                                 coin.amount
                             );
 
@@ -924,15 +966,23 @@ async fn mine_instant_react(
                                 }
                             }
 
-                            // Update current_cat and height for next cycle
-                            let epoch = get_epoch(current_height + 1);
-                            let future_reward = get_reward(epoch);
-                            if let Some(ref cur_cat) = current_cat {
-                                if coin.amount >= future_reward {
-                                    current_cat =
-                                        Some(cur_cat.child(inner_puzzle_hash, coin.amount));
-                                }
+                            // Re-root current_cat at the newly confirmed unspent lode coin so
+                            // that the next grid build uses the correct lineage.  Do NOT
+                            // speculatively advance to the child — the grid's gen=1+ rows cover
+                            // that case and advancing before the bundle lands would cause
+                            // NewPeak retries to fire for a coin that doesn't exist yet.
+                            if let Ok(Some(confirmed_cat)) = bootstrap_cat_from_rpc(
+                                clients,
+                                full_cat_ph,
+                                inner_puzzle_hash,
+                                update_height,
+                            )
+                            .await
+                            {
+                                current_cat = Some(confirmed_cat);
                             }
+                            // If bootstrap fails, keep whatever we had; the existing grid is
+                            // still valid for the current coin.
                             current_height = current_height.max(update_height);
 
                             // Rebuild the 3×3 grid off the Tokio thread so the
@@ -975,7 +1025,7 @@ async fn mine_instant_react(
                                 let spent_h = coin_state.spent_height.unwrap_or(update_height);
                                 println!(
                                     "Lode coin {}… spent by another miner at height {spent_h} — re-bootstrapping lineage",
-                                    &hex::encode(coin.coin_id())[..16]
+                                    &hex::encode(coin.coin_id())
                                 );
                                 match bootstrap_cat_from_rpc(
                                     clients,
@@ -988,7 +1038,7 @@ async fn mine_instant_react(
                                     Ok(Some(new_cat)) => {
                                         println!(
                                             "Re-bootstrapped Cat: coin_id={}…, amount={}",
-                                            &hex::encode(new_cat.coin.coin_id())[..16],
+                                            &hex::encode(new_cat.coin.coin_id()),
                                             new_cat.coin.amount
                                         );
                                         current_height = current_height.max(spent_h);
@@ -1275,7 +1325,7 @@ fn precompute_bundle_grid(
                 let coin_id = root_cat.coin.coin_id();
                 println!(
                     "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen=0)",
-                    &hex::encode(coin_id)[..16]
+                    &hex::encode(coin_id)
                 );
                 grid.push(PrecomputedBundle { target_height, target_coin_id: coin_id, bundle, nonce });
             }
@@ -1363,7 +1413,7 @@ fn precompute_bundle_grid(
             let coin_id = child_cat.coin.coin_id();
             println!(
                 "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen={gen})",
-                &hex::encode(coin_id)[..16]
+                &hex::encode(coin_id)
             );
 
             grid.push(PrecomputedBundle {
@@ -1382,7 +1432,7 @@ fn precompute_bundle_grid(
     println!(
         "Bundle grid ready: {} entries ({} coin generations × {} heights)",
         grid.len(),
-        COIN_GENERATIONS,
+        1 + COIN_GENERATIONS,
         HEIGHT_OFFSETS.len(),
     );
     grid
@@ -1635,7 +1685,7 @@ async fn check_mining_results(
                         _ => {
                             eprintln!(
                                 "Could not retrieve puzzle/solution for {}…",
-                                &hex::encode(coin_id)[..16]
+                                &hex::encode(coin_id)
                             );
                         }
                     }
