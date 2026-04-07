@@ -36,6 +36,10 @@ use crate::puzzle::{
 
 const ERROR_SLEEP_SECS: f64 = 2.0;
 const MAX_NONCE_ATTEMPTS: u64 = 5_000_000;
+/// How long to wait between coin_not_ready retries (seconds).
+const COIN_NOT_READY_RETRY_SECS: f64 = 0.25;
+/// Maximum number of coin_not_ready retries before giving up on a push attempt.
+const COIN_NOT_READY_MAX_RETRIES: u32 = 5;
 
 const EXCAVATOR_ART: &str = r#"
   .-.
@@ -201,6 +205,36 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
 /// Cached spend bundle for a specific (coin_id, height) pair so the polling
 /// loop never grinds the same nonce twice.
 type CachedBundle = Option<(Bytes32, u32, SpendBundle)>;
+
+/// Push a bundle, retrying on `coin_not_ready` up to `COIN_NOT_READY_MAX_RETRIES` times.
+///
+/// The node returns UNKNOWN_UNSPENT when it hasn't yet processed the block that
+/// created the parent coin.  A short sleep + retry loop bridges that race window.
+async fn push_tx_with_retry(
+    clients: &[Arc<dyn RpcClient>],
+    bundle: &SpendBundle,
+    label: &str,
+    debug: bool,
+) -> crate::client::PushTxResult {
+    let mut result = push_tx_to_all(clients, bundle).await;
+    for attempt in 1..=COIN_NOT_READY_MAX_RETRIES {
+        if result.error_category != "coin_not_ready" {
+            break;
+        }
+        if debug {
+            println!(
+                "[debug] {label}: coin_not_ready (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}), retrying in {COIN_NOT_READY_RETRY_SECS}s…"
+            );
+        } else {
+            eprintln!(
+                "{label}: UNKNOWN_UNSPENT — retrying in {COIN_NOT_READY_RETRY_SECS}s (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES})"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs_f64(COIN_NOT_READY_RETRY_SECS)).await;
+        result = push_tx_to_all(clients, bundle).await;
+    }
+    result
+}
 
 async fn mine_polling(
     clients: &[Arc<dyn RpcClient>],
@@ -422,7 +456,7 @@ async fn poll_once(
         .await?
     };
 
-    let result = push_tx_to_all(clients, &bundle).await;
+    let result = push_tx_with_retry(clients, &bundle, "polling", config.debug).await;
     if result.success {
         submitted_coins.insert(coin_id_key, mine_height);
         // Prune stale entries
@@ -762,7 +796,7 @@ async fn mine_instant_react(
                                     "Pushing PRECOMPUTED bundle for height {} (nonce={})",
                                     target_height, nonce
                                 );
-                                let result = push_tx_to_all(clients, &bundle).await;
+                                let result = push_tx_with_retry(clients, &bundle, "precomputed", config.debug).await;
                                 if result.success {
                                     submitted_coins.insert(coin.coin_id(), target_height);
                                     println!(
@@ -855,7 +889,7 @@ async fn mine_instant_react(
                                             ) {
                                                 Ok(bundle) => {
                                                     let result =
-                                                        push_tx_to_all(clients, &bundle).await;
+                                                        push_tx_with_retry(clients, &bundle, "fresh", config.debug).await;
                                                     if result.success {
                                                         submitted_coins
                                                             .insert(coin.coin_id(), fresh_height);
@@ -1039,7 +1073,8 @@ async fn mine_instant_react(
                             println!(
                                 "NewPeak {new_height}: firing precomputed bundle for current lode coin (target_height={target_height}, nonce={nonce})"
                             );
-                            let result = push_tx_to_all(clients, &bundle).await;
+                            let label = format!("NewPeak h={new_height} target={target_height}");
+                            let result = push_tx_with_retry(clients, &bundle, &label, config.debug).await;
                             if result.success {
                                 submitted_coins.insert(current_coin_id, target_height);
                                 println!(
