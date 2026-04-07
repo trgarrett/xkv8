@@ -44,6 +44,12 @@ pub struct Config {
     pub default_sleep_secs: f64,
     pub debug: bool,
     pub genesis_challenge: Bytes32,
+    /// Seconds to wait between `coin_not_ready` / PENDING retries.
+    /// Override with `COIN_NOT_READY_RETRY_SECS` (default: 0.1).
+    pub coin_not_ready_retry_secs: f64,
+    /// Maximum number of `coin_not_ready` / PENDING retries before giving up.
+    /// Override with `COIN_NOT_READY_MAX_RETRIES` (default: 15).
+    pub coin_not_ready_max_retries: u32,
 }
 
 impl Config {
@@ -131,6 +137,18 @@ impl Config {
             MAINNET_GENESIS_CHALLENGE
         };
 
+        // COIN_NOT_READY_RETRY_SECS
+        let coin_not_ready_retry_secs: f64 = env::var("COIN_NOT_READY_RETRY_SECS")
+            .unwrap_or_else(|_| "0.1".into())
+            .parse()
+            .context("COIN_NOT_READY_RETRY_SECS must be a number")?;
+
+        // COIN_NOT_READY_MAX_RETRIES
+        let coin_not_ready_max_retries: u32 = env::var("COIN_NOT_READY_MAX_RETRIES")
+            .unwrap_or_else(|_| "15".into())
+            .parse()
+            .context("COIN_NOT_READY_MAX_RETRIES must be a non-negative integer")?;
+
         Ok(Config {
             target_address,
             target_puzzlehash,
@@ -145,6 +163,8 @@ impl Config {
             default_sleep_secs,
             debug,
             genesis_challenge,
+            coin_not_ready_retry_secs,
+            coin_not_ready_max_retries,
         })
     }
 }

@@ -5,11 +5,54 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chia_protocol::SpendBundle;
+use chia_traits::Streamable;
 use chia_wallet_sdk::coinset::{
     ChiaRpcClient, CoinsetClient, FullNodeClient, PushTxResponse,
 };
+use native_tls::{Identity, TlsConnector};
 
 use crate::config::Config;
+
+// ── Raw-body push_tx helper ────────────────────────────────────────────
+
+/// Maximum bytes of a bad response body to include in the error message.
+const RAW_BODY_SNIPPET_LEN: usize = 512;
+
+/// POST `spend_bundle` to `url` using `client`, read the raw response bytes,
+/// then parse them as JSON.  On any failure the raw body (up to
+/// `RAW_BODY_SNIPPET_LEN` bytes, lossily decoded as UTF-8) is embedded in the
+/// returned error so the caller can see exactly what the server sent back.
+async fn push_tx_raw(
+    http: &reqwest::Client,
+    url: &str,
+    bundle: SpendBundle,
+) -> Result<PushTxResponse> {
+    // Serialise the bundle the same way the SDK does: hex-encoded bytes inside
+    // a JSON wrapper.  `Streamable::to_bytes()` gives the canonical encoding.
+    let bundle_bytes = bundle.to_bytes().map_err(|e| anyhow::anyhow!("bundle serialise: {e}"))?;
+    let body = serde_json::json!({ "spend_bundle": hex::encode(&bundle_bytes) });
+
+    let response = http
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+
+    let status = response.status();
+    let raw = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading response body from {url}"))?;
+
+    serde_json::from_slice::<PushTxResponse>(&raw).map_err(|json_err| {
+        // Produce a human-readable snippet of whatever the server actually sent.
+        let snippet = String::from_utf8_lossy(raw.get(..RAW_BODY_SNIPPET_LEN.min(raw.len())).unwrap_or(&raw));
+        anyhow::anyhow!(
+            "error decoding response body from {url} (HTTP {status}): {json_err}\n  raw body: {snippet}"
+        )
+    })
+}
 
 // ── Abstract client wrapper ────────────────────────────────────────────
 
@@ -45,15 +88,33 @@ pub trait RpcClient: Send + Sync + std::fmt::Debug {
 
 // ── CoinsetClient adapter ──────────────────────────────────────────────
 
+/// Base URL used for all coinset endpoints (mainnet).
+const COINSET_MAINNET_URL: &str = "https://api.coinset.org";
+/// Base URL used for all coinset endpoints (testnet11).
+const COINSET_TESTNET_URL: &str = "https://testnet11.api.coinset.org";
+
 #[derive(Debug, Clone)]
-pub struct CoinsetAdapter(CoinsetClient);
+pub struct CoinsetAdapter {
+    inner: CoinsetClient,
+    /// Plain HTTPS client used for the hardened `push_tx` that captures the raw body.
+    http: reqwest::Client,
+    push_url: String,
+}
 
 impl CoinsetAdapter {
     pub fn mainnet() -> Self {
-        Self(CoinsetClient::mainnet())
+        Self {
+            inner: CoinsetClient::mainnet(),
+            http: reqwest::Client::new(),
+            push_url: format!("{COINSET_MAINNET_URL}/push_tx"),
+        }
     }
     pub fn testnet11() -> Self {
-        Self(CoinsetClient::testnet11())
+        Self {
+            inner: CoinsetClient::testnet11(),
+            http: reqwest::Client::new(),
+            push_url: format!("{COINSET_TESTNET_URL}/push_tx"),
+        }
     }
 }
 
@@ -62,7 +123,7 @@ impl RpcClient for CoinsetAdapter {
     async fn get_blockchain_state(
         &self,
     ) -> Result<chia_wallet_sdk::coinset::BlockchainStateResponse> {
-        Ok(ChiaRpcClient::get_blockchain_state(&self.0).await.map_err(|e| anyhow::anyhow!("{e}"))?)
+        Ok(ChiaRpcClient::get_blockchain_state(&self.inner).await.map_err(|e| anyhow::anyhow!("{e}"))?)
     }
     async fn get_coin_records_by_puzzle_hash(
         &self,
@@ -72,7 +133,7 @@ impl RpcClient for CoinsetAdapter {
         include_spent: Option<bool>,
     ) -> Result<chia_wallet_sdk::coinset::GetCoinRecordsResponse> {
         Ok(ChiaRpcClient::get_coin_records_by_puzzle_hash(
-            &self.0,
+            &self.inner,
             puzzle_hash,
             start_height,
             end_height,
@@ -85,7 +146,7 @@ impl RpcClient for CoinsetAdapter {
         &self,
         name: chia_protocol::Bytes32,
     ) -> Result<chia_wallet_sdk::coinset::GetCoinRecordResponse> {
-        Ok(ChiaRpcClient::get_coin_record_by_name(&self.0, name)
+        Ok(ChiaRpcClient::get_coin_record_by_name(&self.inner, name)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?)
     }
@@ -94,35 +155,67 @@ impl RpcClient for CoinsetAdapter {
         coin_id: chia_protocol::Bytes32,
         height: Option<u32>,
     ) -> Result<chia_wallet_sdk::coinset::GetPuzzleAndSolutionResponse> {
-        Ok(ChiaRpcClient::get_puzzle_and_solution(&self.0, coin_id, height)
+        Ok(ChiaRpcClient::get_puzzle_and_solution(&self.inner, coin_id, height)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?)
     }
+    /// Hardened push: captures the raw response body on JSON-decode failure.
     async fn push_tx(&self, bundle: SpendBundle) -> Result<PushTxResponse> {
-        Ok(ChiaRpcClient::push_tx(&self.0, bundle)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?)
+        push_tx_raw(&self.http, &self.push_url, bundle).await
     }
 }
 
 // ── FullNodeClient adapter ─────────────────────────────────────────────
 
 #[derive(Debug)]
-pub struct FullNodeAdapter(FullNodeClient);
+pub struct FullNodeAdapter {
+    inner: FullNodeClient,
+    /// mTLS client used for the hardened `push_tx` that captures the raw body.
+    http: reqwest::Client,
+    push_url: String,
+}
 
 impl FullNodeAdapter {
     pub fn new(cert_bytes: &[u8], key_bytes: &[u8]) -> Result<Self> {
-        Ok(Self(
-            FullNodeClient::new(cert_bytes, key_bytes)
-                .map_err(|e| anyhow::anyhow!("TLS client init: {e}"))?,
-        ))
+        let inner = FullNodeClient::new(cert_bytes, key_bytes)
+            .map_err(|e| anyhow::anyhow!("TLS client init: {e}"))?;
+        let http = build_mtls_client(cert_bytes, key_bytes, "https://localhost:8555")?;
+        Ok(Self {
+            inner,
+            http,
+            push_url: "https://localhost:8555/push_tx".to_string(),
+        })
     }
     pub fn with_url(url: String, cert_bytes: &[u8], key_bytes: &[u8]) -> Result<Self> {
-        Ok(Self(
-            FullNodeClient::with_base_url(url, cert_bytes, key_bytes)
-                .map_err(|e| anyhow::anyhow!("TLS client init: {e}"))?,
-        ))
+        let inner = FullNodeClient::with_base_url(url.clone(), cert_bytes, key_bytes)
+            .map_err(|e| anyhow::anyhow!("TLS client init: {e}"))?;
+        let http = build_mtls_client(cert_bytes, key_bytes, &url)?;
+        let push_url = format!("{}/push_tx", url.trim_end_matches('/'));
+        Ok(Self { inner, http, push_url })
     }
+}
+
+/// Build a `reqwest::Client` that presents `cert_bytes`/`key_bytes` as a
+/// client certificate and accepts any server certificate (the Chia full-node
+/// uses a self-signed cert signed by the embedded Chia CA).
+fn build_mtls_client(cert_bytes: &[u8], key_bytes: &[u8], _base_url: &str) -> Result<reqwest::Client> {
+    // Combine PEM cert + key into a PKCS#12 Identity via native-tls.
+    let identity = Identity::from_pkcs8(cert_bytes, key_bytes)
+        .with_context(|| "building TLS identity for hardened push_tx client")?;
+
+    let tls = TlsConnector::builder()
+        .identity(identity)
+        // The Chia node presents a self-signed cert; accept it.
+        .danger_accept_invalid_certs(true)
+        .build()
+        .with_context(|| "building native-tls connector for hardened push_tx client")?;
+
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .with_context(|| "building reqwest client for hardened push_tx")?;
+
+    Ok(client)
 }
 
 #[async_trait::async_trait]
@@ -130,7 +223,7 @@ impl RpcClient for FullNodeAdapter {
     async fn get_blockchain_state(
         &self,
     ) -> Result<chia_wallet_sdk::coinset::BlockchainStateResponse> {
-        Ok(ChiaRpcClient::get_blockchain_state(&self.0).await.map_err(|e| anyhow::anyhow!("{e}"))?)
+        Ok(ChiaRpcClient::get_blockchain_state(&self.inner).await.map_err(|e| anyhow::anyhow!("{e}"))?)
     }
     async fn get_coin_records_by_puzzle_hash(
         &self,
@@ -140,7 +233,7 @@ impl RpcClient for FullNodeAdapter {
         include_spent: Option<bool>,
     ) -> Result<chia_wallet_sdk::coinset::GetCoinRecordsResponse> {
         Ok(ChiaRpcClient::get_coin_records_by_puzzle_hash(
-            &self.0,
+            &self.inner,
             puzzle_hash,
             start_height,
             end_height,
@@ -153,7 +246,7 @@ impl RpcClient for FullNodeAdapter {
         &self,
         name: chia_protocol::Bytes32,
     ) -> Result<chia_wallet_sdk::coinset::GetCoinRecordResponse> {
-        Ok(ChiaRpcClient::get_coin_record_by_name(&self.0, name)
+        Ok(ChiaRpcClient::get_coin_record_by_name(&self.inner, name)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?)
     }
@@ -162,14 +255,13 @@ impl RpcClient for FullNodeAdapter {
         coin_id: chia_protocol::Bytes32,
         height: Option<u32>,
     ) -> Result<chia_wallet_sdk::coinset::GetPuzzleAndSolutionResponse> {
-        Ok(ChiaRpcClient::get_puzzle_and_solution(&self.0, coin_id, height)
+        Ok(ChiaRpcClient::get_puzzle_and_solution(&self.inner, coin_id, height)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?)
     }
+    /// Hardened push: captures the raw response body on JSON-decode failure.
     async fn push_tx(&self, bundle: SpendBundle) -> Result<PushTxResponse> {
-        Ok(ChiaRpcClient::push_tx(&self.0, bundle)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?)
+        push_tx_raw(&self.http, &self.push_url, bundle).await
     }
 }
 

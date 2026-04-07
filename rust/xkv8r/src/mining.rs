@@ -36,10 +36,6 @@ use crate::puzzle::{
 
 const ERROR_SLEEP_SECS: f64 = 2.0;
 const MAX_NONCE_ATTEMPTS: u64 = 5_000_000;
-/// How long to wait between coin_not_ready retries (seconds).
-const COIN_NOT_READY_RETRY_SECS: f64 = 0.1;
-/// Maximum number of coin_not_ready retries before giving up on a push attempt.
-const COIN_NOT_READY_MAX_RETRIES: u32 = 15;
 
 const EXCAVATOR_ART: &str = r#"
   .-.
@@ -217,8 +213,12 @@ async fn push_tx_with_retry(
     clients: &[Arc<dyn RpcClient>],
     bundle: &SpendBundle,
     label: &str,
-    debug: bool,
+    config: &Config,
 ) -> crate::client::PushTxResult {
+    let retry_secs = config.coin_not_ready_retry_secs;
+    let max_retries = config.coin_not_ready_max_retries;
+    let debug = config.debug;
+
     let mut result = push_tx_to_all(clients, bundle).await;
     // Track the best (most recent success) result seen across all attempts so
     // that a transport error on a *retry* never clobbers an earlier success.
@@ -228,7 +228,7 @@ async fn push_tx_with_retry(
         None
     };
 
-    for attempt in 1..=COIN_NOT_READY_MAX_RETRIES {
+    for attempt in 1..=max_retries {
         let is_pending = result.success
             && result.status.as_deref().map(|s| s.eq_ignore_ascii_case("pending")).unwrap_or(false);
         let is_not_ready = !result.success && result.error_category == "coin_not_ready";
@@ -240,14 +240,14 @@ async fn push_tx_with_retry(
         let reason = if is_pending { "PENDING (unconfirmed)" } else { "UNKNOWN_UNSPENT" };
         if debug {
             println!(
-                "[debug] {label}: {reason} (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}), retrying in {COIN_NOT_READY_RETRY_SECS}s…"
+                "[debug] {label}: {reason} (attempt {attempt}/{max_retries}), retrying in {retry_secs}s…"
             );
         } else {
             eprintln!(
-                "{label}: {reason} — retrying in {COIN_NOT_READY_RETRY_SECS}s (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES})"
+                "{label}: {reason} — retrying in {retry_secs}s (attempt {attempt}/{max_retries})"
             );
         }
-        tokio::time::sleep(Duration::from_secs_f64(COIN_NOT_READY_RETRY_SECS)).await;
+        tokio::time::sleep(Duration::from_secs_f64(retry_secs)).await;
         result = push_tx_to_all(clients, bundle).await;
 
         if result.success {
@@ -263,7 +263,7 @@ async fn push_tx_with_retry(
                 .as_deref()
                 .map_or(false, |e| e.contains("error decoding response body"));
             eprintln!(
-                "{label}: transport error on retry attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}: {:?}",
+                    "{label}: transport error on retry attempt {attempt}/{max_retries}: {:?}",
                 result.error
             );
             if is_decode_err {
@@ -503,7 +503,7 @@ async fn poll_once(
         .await?
     };
 
-    let result = push_tx_with_retry(clients, &bundle, "polling", config.debug).await;
+    let result = push_tx_with_retry(clients, &bundle, "polling", config).await;
     if result.success {
         submitted_coins.insert(coin_id_key, mine_height);
         // Prune stale entries
@@ -847,7 +847,7 @@ async fn mine_instant_react(
                                     "Pushing PRECOMPUTED bundle for height {} (nonce={})",
                                     target_height, nonce
                                 );
-                                let result = push_tx_with_retry(clients, &bundle, "precomputed", config.debug).await;
+                                let result = push_tx_with_retry(clients, &bundle, "precomputed", config).await;
                                 if result.success {
                                     submitted_coins.insert(coin.coin_id(), target_height);
                                     println!(
@@ -940,7 +940,7 @@ async fn mine_instant_react(
                                             ) {
                                                 Ok(bundle) => {
                                                     let result =
-                                                        push_tx_with_retry(clients, &bundle, "fresh", config.debug).await;
+                                                        push_tx_with_retry(clients, &bundle, "fresh", config).await;
                                                     if result.success {
                                                         submitted_coins
                                                             .insert(coin.coin_id(), fresh_height);
@@ -1134,7 +1134,7 @@ async fn mine_instant_react(
                                 hex::encode(current_coin_id)
                             );
                             let label = format!("NewPeak h={new_height} target={target_height}");
-                            let result = push_tx_with_retry(clients, &bundle, &label, config.debug).await;
+                            let result = push_tx_with_retry(clients, &bundle, &label, config).await;
                             if result.success {
                                 submitted_coins.insert(current_coin_id, target_height);
                                 println!(
