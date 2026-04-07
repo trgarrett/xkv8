@@ -206,10 +206,13 @@ pub async fn mine(config: Arc<Config>) -> Result<()> {
 /// loop never grinds the same nonce twice.
 type CachedBundle = Option<(Bytes32, u32, SpendBundle)>;
 
-/// Push a bundle, retrying on `coin_not_ready` up to `COIN_NOT_READY_MAX_RETRIES` times.
+/// Push a bundle, retrying on transient node states up to `COIN_NOT_READY_MAX_RETRIES` times.
 ///
-/// The node returns UNKNOWN_UNSPENT when it hasn't yet processed the block that
-/// created the parent coin.  A short sleep + retry loop bridges that race window.
+/// Two retry conditions:
+/// - `coin_not_ready` (UNKNOWN_UNSPENT): the node hasn't indexed the parent coin yet.
+/// - `status == "PENDING"`: the node acknowledged receipt but the tx may be silently
+///   dropped before reaching the mempool.  Resubmitting causes the node to either
+///   confirm it properly, return mempool_conflict (already there), or re-evaluate.
 async fn push_tx_with_retry(
     clients: &[Arc<dyn RpcClient>],
     bundle: &SpendBundle,
@@ -218,16 +221,22 @@ async fn push_tx_with_retry(
 ) -> crate::client::PushTxResult {
     let mut result = push_tx_to_all(clients, bundle).await;
     for attempt in 1..=COIN_NOT_READY_MAX_RETRIES {
-        if result.error_category != "coin_not_ready" {
+        let is_pending = result.success
+            && result.status.as_deref().map(|s| s.eq_ignore_ascii_case("pending")).unwrap_or(false);
+        let is_not_ready = !result.success && result.error_category == "coin_not_ready";
+
+        if !is_pending && !is_not_ready {
             break;
         }
+
+        let reason = if is_pending { "PENDING (unconfirmed)" } else { "UNKNOWN_UNSPENT" };
         if debug {
             println!(
-                "[debug] {label}: coin_not_ready (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}), retrying in {COIN_NOT_READY_RETRY_SECS}s…"
+                "[debug] {label}: {reason} (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES}), retrying in {COIN_NOT_READY_RETRY_SECS}s…"
             );
         } else {
             eprintln!(
-                "{label}: UNKNOWN_UNSPENT — retrying in {COIN_NOT_READY_RETRY_SECS}s (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES})"
+                "{label}: {reason} — retrying in {COIN_NOT_READY_RETRY_SECS}s (attempt {attempt}/{COIN_NOT_READY_MAX_RETRIES})"
             );
         }
         tokio::time::sleep(Duration::from_secs_f64(COIN_NOT_READY_RETRY_SECS)).await;
