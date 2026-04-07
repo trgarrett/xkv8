@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chia_protocol::SpendBundle;
-use chia_traits::Streamable;
 use chia_wallet_sdk::coinset::{
     ChiaRpcClient, CoinsetClient, FullNodeClient, PushTxResponse,
 };
@@ -22,15 +21,48 @@ const RAW_BODY_SNIPPET_LEN: usize = 512;
 /// then parse them as JSON.  On any failure the raw body (up to
 /// `RAW_BODY_SNIPPET_LEN` bytes, lossily decoded as UTF-8) is embedded in the
 /// returned error so the caller can see exactly what the server sent back.
+/// Recursively prefix every bare hex string value in a JSON tree with `"0x"`.
+///
+/// The `chia-protocol` serde impl emits plain hex (e.g. `"abc123…"`) but the
+/// Chia Python RPC requires `"0x"`-prefixed hex on every bytes field.
+pub(crate) fn prefix_hex_values(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            if !s.starts_with("0x")
+                && !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                *s = format!("0x{s}");
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                prefix_hex_values(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                prefix_hex_values(val);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn push_tx_raw(
     http: &reqwest::Client,
     url: &str,
     bundle: SpendBundle,
 ) -> Result<PushTxResponse> {
-    // Serialise the bundle the same way the SDK does: hex-encoded bytes inside
-    // a JSON wrapper.  `Streamable::to_bytes()` gives the canonical encoding.
-    let bundle_bytes = bundle.to_bytes().map_err(|e| anyhow::anyhow!("bundle serialise: {e}"))?;
-    let body = serde_json::json!({ "spend_bundle": hex::encode(&bundle_bytes) });
+    // Serialise the bundle as a JSON object — the Chia RPC expects:
+    //   {"spend_bundle": {"coin_spends": [...], "aggregated_signature": "..."}}
+    // SpendBundle implements serde::Serialize and produces exactly this shape,
+    // except the chia-protocol serde impl uses plain hex; the Python RPC needs
+    // 0x-prefixed hex on every bytes field.
+    let mut bundle_val = serde_json::to_value(&bundle)
+        .with_context(|| "serialising SpendBundle to JSON")?;
+    prefix_hex_values(&mut bundle_val);
+    let body = serde_json::json!({ "spend_bundle": bundle_val });
 
     let response = http
         .post(url)

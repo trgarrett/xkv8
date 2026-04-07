@@ -202,27 +202,12 @@ fn build_fee_spends(
 }
 
 fn print_debug_bundle(bundle: &SpendBundle) {
-    let coin_spends_json: Vec<serde_json::Value> = bundle
-        .coin_spends
-        .iter()
-        .map(|cs| {
-            serde_json::json!({
-                "coin": {
-                    "parent_coin_info": hex::encode(cs.coin.parent_coin_info),
-                    "puzzle_hash": hex::encode(cs.coin.puzzle_hash),
-                    "amount": cs.coin.amount,
-                },
-                "puzzle_reveal": hex::encode(cs.puzzle_reveal.as_ref()),
-                "solution": hex::encode(cs.solution.as_ref()),
-            })
-        })
-        .collect();
-
-    let bundle_json = serde_json::json!({
-        "coin_spends": coin_spends_json,
-        "aggregated_signature": hex::encode(bundle.aggregated_signature.to_bytes()),
-    });
+    // Reuse the same serialisation path used by push_tx_raw so the debug
+    // output always matches what is actually sent to the node (0x-prefixed hex).
+    let mut bundle_val = serde_json::to_value(bundle)
+        .expect("SpendBundle serialisation failed");
+    crate::client::prefix_hex_values(&mut bundle_val);
 
     println!("[DEBUG] Spend bundle JSON:");
-    println!("{}", serde_json::to_string_pretty(&bundle_json).unwrap());
+    println!("{}", serde_json::to_string_pretty(&bundle_val).unwrap());
 }
