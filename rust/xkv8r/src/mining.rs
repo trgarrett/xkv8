@@ -916,7 +916,8 @@ async fn mine_instant_react(
 
                         // Lode coin spent
                         if coin_state.spent_height.is_some() {
-                            if submitted_coins.remove(&coin.coin_id()).is_some() {
+                            let we_submitted = submitted_coins.remove(&coin.coin_id()).is_some();
+                            if we_submitted {
                                 check_mining_results(
                                     clients[0].as_ref(),
                                     inner_puzzle_hash,
@@ -925,6 +926,55 @@ async fn mine_instant_react(
                                     &config.target_address,
                                 )
                                 .await;
+                            } else {
+                                // Another miner spent this coin.  Re-bootstrap current_cat
+                                // from RPC so the next grid is rooted at the actual chain tip.
+                                let spent_h = coin_state.spent_height.unwrap_or(update_height);
+                                println!(
+                                    "Lode coin {}… spent by another miner at height {spent_h} — re-bootstrapping lineage",
+                                    &hex::encode(coin.coin_id())[..16]
+                                );
+                                match bootstrap_cat_from_rpc(
+                                    clients,
+                                    full_cat_ph,
+                                    inner_puzzle_hash,
+                                    spent_h,
+                                )
+                                .await
+                                {
+                                    Ok(Some(new_cat)) => {
+                                        println!(
+                                            "Re-bootstrapped Cat: coin_id={}…, amount={}",
+                                            &hex::encode(new_cat.coin.coin_id())[..16],
+                                            new_cat.coin.amount
+                                        );
+                                        current_height = current_height.max(spent_h);
+                                        current_cat = Some(new_cat);
+                                        // Rebuild grid from the new root off-thread
+                                        let cfg = config.clone();
+                                        let cat = current_cat.clone();
+                                        let iph = inner_puzzle_hash;
+                                        let pkb = *pk_bytes;
+                                        let sk2 = sk.clone();
+                                        let fph = fee_puzzlehash;
+                                        let ssk = synthetic_sk.clone();
+                                        let spk = *synthetic_pk;
+                                        let fc = fee_coins.clone();
+                                        let ch = current_height;
+                                        bundle_grid = tokio::task::spawn_blocking(move || {
+                                            precompute_bundle_grid(
+                                                &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
+                                            )
+                                        })
+                                        .await?;
+                                    }
+                                    Ok(None) => {
+                                        eprintln!("Re-bootstrap failed: no unspent lode coin found after rival spend at height {spent_h}");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Re-bootstrap error after rival spend: {e}");
+                                    }
+                                }
                             }
                         }
                     }
