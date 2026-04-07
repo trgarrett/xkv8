@@ -620,7 +620,7 @@ async fn mine_instant_react(
     let sub_resp = peer
         .request_puzzle_state(
             puzzle_hashes.clone(),
-            Some(height.saturating_sub(10)),
+            Some(height),
             header_hash,
             filters,
             true,
@@ -640,9 +640,14 @@ async fn mine_instant_react(
                 respond.coin_states.len(),
             );
             if respond.is_finished {
+                // is_finished=true can occur transiently (e.g. the peer processed
+                // the request before the subscription was fully registered).
+                // Log a warning and continue — if the peer truly does not support
+                // live subscriptions we will see no CoinStateUpdate messages and
+                // the 60-second receive timeout will trigger a reconnect naturally.
                 eprintln!(
-                    "Warning: peer returned is_finished=true — subscription may not be active. \
-                     The node may not support live puzzle-hash subscriptions on this port/version."
+                    "Warning: peer returned is_finished=true on puzzle state subscription. \
+                     Continuing in instant-react mode; will fall back if no events arrive."
                 );
             }
         }
@@ -654,19 +659,11 @@ async fn mine_instant_react(
         }
     }
 
-    // Start precomputing first bundle
-    let mut precomputed_bundle: Option<PrecomputedBundle> = precompute_bundle(
-        config,
-        &current_cat,
-        current_height,
-        inner_puzzle_hash,
-        pk_bytes,
-        sk,
-        fee_puzzlehash,
-        synthetic_sk,
-        synthetic_pk,
-        &fee_coins,
-    );
+    // Start with an empty grid — the first NewPeakWallet message (which
+    // arrives within seconds) will trigger the initial grid build.
+    // Precomputing here would block for ~9 nonce grinds and cause the peer
+    // to see is_finished=true before we start consuming subscription messages.
+    let mut bundle_grid: Vec<PrecomputedBundle> = Vec::new();
 
     println!("Instant-react mining active — waiting for block events…");
     println!();
@@ -705,21 +702,29 @@ async fn mine_instant_react(
                             coin_state.spent_height,
                         );
                         if coin.puzzle_hash == full_cat_ph {
-                            if let Some(ref pre) = precomputed_bundle {
+                            let matches: Vec<_> = bundle_grid
+                                .iter()
+                                .filter(|p| p.target_coin_id == coin.coin_id())
+                                .collect();
+                            if matches.is_empty() {
                                 println!(
-                                    "[debug]   → lode coin! precomputed target_coin={} match={}",
-                                    hex::encode(pre.target_coin_id),
-                                    pre.target_coin_id == coin.coin_id(),
+                                    "[debug]   → lode coin! grid has {} entries, none match coin_id",
+                                    bundle_grid.len()
                                 );
                             } else {
-                                println!("[debug]   → lode coin! no precomputed bundle");
+                                for m in &matches {
+                                    println!(
+                                        "[debug]   → lode coin! grid match: target_height={} nonce={}",
+                                        m.target_height, m.nonce
+                                    );
+                                }
                             }
                         }
                     }
 
                     // ── Lode coin events ─────────────────────────
                     if coin.puzzle_hash == full_cat_ph {
-                        // New lode coin confirmed
+                        // New lode coin confirmed (not yet spent)
                         if coin_state.created_height.is_some()
                             && coin_state.spent_height.is_none()
                         {
@@ -730,123 +735,138 @@ async fn mine_instant_react(
                                 coin.amount
                             );
 
-                            if let Some(ref pre) = precomputed_bundle {
-                                if pre.target_coin_id == coin.coin_id() {
-                                    // FIRE IMMEDIATELY
+                            // Look for the best grid entry: matching coin_id, LOWEST
+                            // target_height that is still valid (>= update_height and
+                            // within the 3-block window).  As sole miner the coin
+                            // confirms at update_height and we want the bundle that
+                            // can be included in the very next block — not the latest
+                            // one (which would stall us 1-2 extra blocks).
+                            let best_pre = bundle_grid
+                                .iter()
+                                .filter(|p| {
+                                    p.target_coin_id == coin.coin_id()
+                                        && p.target_height >= update_height
+                                        && p.target_height <= update_height + 2
+                                })
+                                .min_by_key(|p| p.target_height)
+                                .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
+
+                            if let Some((bundle, target_height, nonce)) = best_pre {
+                                // FIRE IMMEDIATELY from grid
+                                println!(
+                                    "Pushing PRECOMPUTED bundle for height {} (nonce={})",
+                                    target_height, nonce
+                                );
+                                let result = push_tx_to_all(clients, &bundle).await;
+                                if result.success {
+                                    submitted_coins.insert(coin.coin_id(), target_height);
                                     println!(
-                                        "Pushing PRECOMPUTED bundle for height {} (nonce={})",
-                                        pre.target_height, pre.nonce
+                                        "Submitted precomputed mining spend for height {}, Status={:?}",
+                                        target_height, result.status
                                     );
-                                    let result = push_tx_to_all(clients, &pre.bundle).await;
-                                    if result.success {
-                                        submitted_coins
-                                            .insert(coin.coin_id(), pre.target_height);
-                                        println!(
-                                            "Submitted precomputed mining spend for height {}, Status={:?}",
-                                            pre.target_height, result.status
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "Precomputed push failed: {:?} [{}]",
-                                            result.error, result.error_category
-                                        );
-                                    }
                                 } else {
-                                    // Build fresh
-                                    println!("No matching precomputed bundle — building fresh");
-                                    precomputed_bundle = None;
+                                    eprintln!(
+                                        "Precomputed push failed: {:?} [{}]",
+                                        result.error, result.error_category
+                                    );
+                                }
+                            } else {
+                                // Nothing in grid matches — build fresh
+                                println!(
+                                    "No matching precomputed bundle in grid ({} entries) — building fresh",
+                                    bundle_grid.len()
+                                );
 
-                                    if let Some(ref cur_cat) = current_cat {
-                                        let new_cat =
-                                            cur_cat.child(inner_puzzle_hash, coin.amount);
-                                        let cat_to_use =
-                                            if new_cat.coin.coin_id() == coin.coin_id() {
-                                                Some(new_cat)
-                                            } else {
-                                                bootstrap_cat_from_rpc(
-                                                    clients,
-                                                    full_cat_ph,
-                                                    inner_puzzle_hash,
-                                                    update_height,
-                                                )
-                                                .await
-                                                .ok()
-                                                .flatten()
-                                            };
+                                if let Some(ref cur_cat) = current_cat {
+                                    let new_cat =
+                                        cur_cat.child(inner_puzzle_hash, coin.amount);
+                                    let cat_to_use =
+                                        if new_cat.coin.coin_id() == coin.coin_id() {
+                                            Some(new_cat)
+                                        } else {
+                                            bootstrap_cat_from_rpc(
+                                                clients,
+                                                full_cat_ph,
+                                                inner_puzzle_hash,
+                                                update_height,
+                                            )
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                        };
 
-                                        if let Some(fresh_cat) = cat_to_use {
-                                            let fresh_height = update_height + 1;
-                                            let epoch = get_epoch(fresh_height);
-                                            let reward_val = get_reward(epoch);
-                                            let diff_bits = get_difficulty_bits(epoch);
+                                    if let Some(fresh_cat) = cat_to_use {
+                                        let fresh_height = update_height + 1;
+                                        let epoch = get_epoch(fresh_height);
+                                        let reward_val = get_reward(epoch);
+                                        let diff_bits = get_difficulty_bits(epoch);
 
-                                            if coin.amount < reward_val {
-                                                eprintln!(
-                                                    "Lode coin amount ({}) < reward ({}), skipping",
-                                                    coin.amount, reward_val
-                                                );
-                                                continue;
-                                            }
+                                        if coin.amount < reward_val {
+                                            eprintln!(
+                                                "Lode coin amount ({}) < reward ({}), skipping",
+                                                coin.amount, reward_val
+                                            );
+                                            continue;
+                                        }
 
-                                            let cancel = Arc::new(AtomicBool::new(false));
-                                            let iph = inner_puzzle_hash;
-                                            let pkb = *pk_bytes;
-                                            let cancel2 = cancel.clone();
-                                            let tc = config.thread_count;
-                                            let grind_start = Instant::now();
-                                            let nonce = tokio::task::spawn_blocking(move || {
-                                                find_valid_nonce(
-                                                    &iph,
-                                                    &pkb,
-                                                    fresh_height,
-                                                    diff_bits,
-                                                    MAX_NONCE_ATTEMPTS,
-                                                    tc,
-                                                    cancel2,
-                                                )
-                                            })
-                                            .await?;
+                                        let cancel = Arc::new(AtomicBool::new(false));
+                                        let iph = inner_puzzle_hash;
+                                        let pkb = *pk_bytes;
+                                        let cancel2 = cancel.clone();
+                                        let tc = config.thread_count;
+                                        let grind_start = Instant::now();
+                                        let nonce = tokio::task::spawn_blocking(move || {
+                                            find_valid_nonce(
+                                                &iph,
+                                                &pkb,
+                                                fresh_height,
+                                                diff_bits,
+                                                MAX_NONCE_ATTEMPTS,
+                                                tc,
+                                                cancel2,
+                                            )
+                                        })
+                                        .await?;
 
-                                            if let Some(nonce) = nonce {
-                                                println!("Found nonce {nonce} in {:.2?} — building spend bundle…", grind_start.elapsed());
-                                                match build_mining_bundle(
-                                                    config,
-                                                    &fresh_cat,
-                                                    fresh_height,
-                                                    nonce,
-                                                    inner_puzzle_hash,
-                                                    pk_bytes,
-                                                    sk,
-                                                    &fee_coins,
-                                                    fee_puzzlehash,
-                                                    synthetic_sk,
-                                                    synthetic_pk,
-                                                ) {
-                                                    Ok(bundle) => {
-                                                        let result =
-                                                            push_tx_to_all(clients, &bundle).await;
-                                                        if result.success {
-                                                            submitted_coins
-                                                                .insert(coin.coin_id(), fresh_height);
-                                                            println!("Submitted fresh mining spend for height {fresh_height}, Status={:?}", result.status);
-                                                        } else {
-                                                            eprintln!("Fresh push failed: {:?} [{}]", result.error, result.error_category);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!(
-                                                            "Error building fresh bundle: {e}"
-                                                        );
+                                        if let Some(nonce) = nonce {
+                                            println!("Found nonce {nonce} in {:.2?} — building spend bundle…", grind_start.elapsed());
+                                            match build_mining_bundle(
+                                                config,
+                                                &fresh_cat,
+                                                fresh_height,
+                                                nonce,
+                                                inner_puzzle_hash,
+                                                pk_bytes,
+                                                sk,
+                                                &fee_coins,
+                                                fee_puzzlehash,
+                                                synthetic_sk,
+                                                synthetic_pk,
+                                            ) {
+                                                Ok(bundle) => {
+                                                    let result =
+                                                        push_tx_to_all(clients, &bundle).await;
+                                                    if result.success {
+                                                        submitted_coins
+                                                            .insert(coin.coin_id(), fresh_height);
+                                                        println!("Submitted fresh mining spend for height {fresh_height}, Status={:?}", result.status);
+                                                    } else {
+                                                        eprintln!("Fresh push failed: {:?} [{}]", result.error, result.error_category);
                                                     }
                                                 }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "Error building fresh bundle: {e}"
+                                                    );
+                                                }
                                             }
-                                            current_cat = Some(fresh_cat);
                                         }
+                                        current_cat = Some(fresh_cat);
                                     }
                                 }
                             }
 
-                            // Update cat for next cycle
+                            // Update current_cat and height for next cycle
                             let epoch = get_epoch(current_height + 1);
                             let future_reward = get_reward(epoch);
                             if let Some(ref cur_cat) = current_cat {
@@ -857,19 +877,26 @@ async fn mine_instant_react(
                             }
                             current_height = current_height.max(update_height);
 
-                            // Precompute next bundle
-                            precomputed_bundle = precompute_bundle(
-                                config,
-                                &current_cat,
-                                current_height,
-                                inner_puzzle_hash,
-                                pk_bytes,
-                                sk,
-                                fee_puzzlehash,
-                                synthetic_sk,
-                                synthetic_pk,
-                                &fee_coins,
-                            );
+                            // Rebuild the 3×3 grid off the Tokio thread so the
+                            // peer receive loop is never blocked by nonce grinding.
+                            {
+                                let cfg = config.clone();
+                                let cat = current_cat.clone();
+                                let iph = inner_puzzle_hash;
+                                let pkb = *pk_bytes;
+                                let sk2 = sk.clone();
+                                let fph = fee_puzzlehash;
+                                let ssk = synthetic_sk.clone();
+                                let spk = *synthetic_pk;
+                                let fc = fee_coins.clone();
+                                let ch = current_height;
+                                bundle_grid = tokio::task::spawn_blocking(move || {
+                                    precompute_bundle_grid(
+                                        &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
+                                    )
+                                })
+                                .await?;
+                            }
                         }
 
                         // Lode coin spent
@@ -907,40 +934,91 @@ async fn mine_instant_react(
                     current_height = new_height;
 
                     if config.debug {
-                        match &precomputed_bundle {
-                            Some(pre) => println!(
-                                "[debug] NewPeak {new_height}: precomputed bundle target_height={} target_coin={}…",
-                                pre.target_height,
-                                &hex::encode(pre.target_coin_id)[..16],
-                            ),
-                            None => println!("[debug] NewPeak {new_height}: no precomputed bundle"),
+                        let valid: Vec<_> = bundle_grid
+                            .iter()
+                            .filter(|p| p.target_height + 2 >= new_height)
+                            .collect();
+                        println!(
+                            "[debug] NewPeak {new_height}: grid has {} total entries, {} still valid",
+                            bundle_grid.len(),
+                            valid.len(),
+                        );
+                    }
+
+                    // Prune entries whose 3-block window has fully expired
+                    let before = bundle_grid.len();
+                    bundle_grid.retain(|p| p.target_height + 2 >= new_height);
+                    let pruned = before - bundle_grid.len();
+                    if pruned > 0 && config.debug {
+                        println!("[debug] NewPeak {new_height}: pruned {pruned} expired grid entries ({} remain)", bundle_grid.len());
+                    }
+
+                    // If the current lode coin is unspent and we have a grid entry
+                    // that spends it at this height, fire it now.  This is what
+                    // drives the chain forward when we are the sole miner (no
+                    // CoinStateUpdate ever arrives for the unspent coin).
+                    if let Some(ref cur_cat) = current_cat {
+                        let current_coin_id = cur_cat.coin.coin_id();
+                        if !submitted_coins.contains_key(&current_coin_id) {
+                            let best = bundle_grid
+                                .iter()
+                                .filter(|p| {
+                                    p.target_coin_id == current_coin_id
+                                        && p.target_height >= new_height
+                                        && p.target_height <= new_height + 2
+                                })
+                                .min_by_key(|p| p.target_height)
+                                .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
+
+                            if let Some((bundle, target_height, nonce)) = best {
+                                println!(
+                                    "NewPeak {new_height}: firing precomputed bundle for current lode coin (target_height={target_height}, nonce={nonce})"
+                                );
+                                let result = push_tx_to_all(clients, &bundle).await;
+                                if result.success {
+                                    submitted_coins.insert(current_coin_id, target_height);
+                                    println!(
+                                        "Submitted mining spend for height {target_height}, Status={:?}",
+                                        result.status
+                                    );
+                                } else {
+                                    match result.error_category {
+                                        "mempool_conflict" => {
+                                            if config.debug {
+                                                println!("[debug] NewPeak fire: already in mempool");
+                                            }
+                                        }
+                                        cat => eprintln!(
+                                            "NewPeak fire failed: {:?} [{cat}]",
+                                            result.error
+                                        ),
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    if let Some(ref pre) = precomputed_bundle {
-                        if new_height > pre.target_height + 2 {
-                            // Bundle's 3-block validity window [target..target+2] has
-                            // expired without a CoinStateUpdate triggering the push.
-                            // Recompute for the new height.
-                            println!(
-                                "Height advanced to {new_height}, precomputed target {} expired (window was {}..{}) — recomputing",
-                                pre.target_height, pre.target_height, pre.target_height + 2
-                            );
-                            precomputed_bundle = precompute_bundle(
-                                config,
-                                &current_cat,
-                                current_height,
-                                inner_puzzle_hash,
-                                pk_bytes,
-                                sk,
-                                fee_puzzlehash,
-                                synthetic_sk,
-                                synthetic_pk,
-                                &fee_coins,
-                            );
-                        }
-                        // Otherwise the bundle is still valid — it will be pushed
-                        // when CoinStateUpdate confirms the target coin on-chain.
+                    // If grid is empty, recompute off the Tokio thread
+                    if bundle_grid.is_empty() {
+                        println!(
+                            "Height advanced to {new_height}, bundle grid fully expired — recomputing 3×3 grid"
+                        );
+                        let cfg = config.clone();
+                        let cat = current_cat.clone();
+                        let iph = inner_puzzle_hash;
+                        let pkb = *pk_bytes;
+                        let sk2 = sk.clone();
+                        let fph = fee_puzzlehash;
+                        let ssk = synthetic_sk.clone();
+                        let spk = *synthetic_pk;
+                        let fc = fee_coins.clone();
+                        let ch = current_height;
+                        bundle_grid = tokio::task::spawn_blocking(move || {
+                            precompute_bundle_grid(
+                                &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
+                            )
+                        })
+                        .await?;
                     }
 
                     if !submitted_coins.is_empty() {
@@ -964,7 +1042,16 @@ async fn mine_instant_react(
     }
 }
 
-// ── Precomputed bundle ─────────────────────────────────────────────────
+// ── Precomputed bundle grid ────────────────────────────────────────────
+//
+// We speculatively build a 3 (coin generations) × 3 (mine heights) grid.
+// Rows  : child, grandchild, great-grandchild of the current lode coin.
+// Cols  : current_height+1, current_height+2, current_height+3.
+//
+// This covers the most common race conditions:
+//   • The chain advances a block or two before our update arrives.
+//   • The lode coin we track turns out to be a grandparent of what the chain
+//     actually confirmed (because another miner fired first).
 
 struct PrecomputedBundle {
     target_height: u32,
@@ -973,8 +1060,19 @@ struct PrecomputedBundle {
     nonce: u64,
 }
 
+/// Build a 3×3 grid of precomputed spend bundles.
+///
+/// Rows  (coin axis) : child → grandchild → great-grandchild of `current_cat`.
+/// Cols  (height axis): current_height+1, +2, +3.
+///
+/// Each cell is independent: a different nonce is ground for every
+/// (coin_id, mine_height) pair so that whichever combination the chain
+/// actually presents can be pushed immediately.
+///
+/// Entries that cannot be built (e.g. insufficient amount, nonce not found)
+/// are silently skipped — the returned `Vec` may have fewer than 9 entries.
 #[allow(clippy::too_many_arguments)]
-fn precompute_bundle(
+fn precompute_bundle_grid(
     config: &Config,
     current_cat: &Option<Cat>,
     current_height: u32,
@@ -985,69 +1083,190 @@ fn precompute_bundle(
     synthetic_sk: &SecretKey,
     synthetic_pk: &PublicKey,
     fee_coins: &[Coin],
-) -> Option<PrecomputedBundle> {
-    let cat = current_cat.as_ref()?;
+) -> Vec<PrecomputedBundle> {
+    const COIN_GENERATIONS: usize = 3;
+    const HEIGHT_OFFSETS: [u32; 3] = [1, 2, 3];
 
-    let current_epoch = get_epoch(current_height);
-    let current_reward = get_reward(current_epoch);
+    let root_cat = match current_cat.as_ref() {
+        Some(c) => c.clone(),
+        None => return Vec::new(),
+    };
 
-    if cat.coin.amount < current_reward {
-        eprintln!(
-            "Lode coin amount ({}) insufficient for reward ({})",
-            cat.coin.amount, current_reward
-        );
-        return None;
+    // Total entries: (COIN_GENERATIONS + 1) coins × HEIGHT_OFFSETS heights.
+    // gen=0: spend root_cat itself (sole-miner first move).
+    // gen=1..=COIN_GENERATIONS: spend child, grandchild, great-grandchild
+    //   (used when another miner or a prior spend has already created the child).
+    let mut grid: Vec<PrecomputedBundle> =
+        Vec::with_capacity((COIN_GENERATIONS + 1) * HEIGHT_OFFSETS.len());
+
+    // --- gen=0: spend root_cat (the current unspent lode coin) ----------
+    {
+        let base_epoch = get_epoch(current_height);
+        let base_reward = get_reward(base_epoch);
+        if root_cat.coin.amount >= base_reward {
+            for &height_offset in &HEIGHT_OFFSETS {
+                let target_height = current_height + height_offset;
+                let epoch = get_epoch(target_height);
+                let diff_bits = get_difficulty_bits(epoch);
+
+                let cancel = Arc::new(AtomicBool::new(false));
+                let grind_start = Instant::now();
+                let nonce = match find_valid_nonce(
+                    &inner_puzzle_hash,
+                    pk_bytes,
+                    target_height,
+                    diff_bits,
+                    MAX_NONCE_ATTEMPTS,
+                    config.thread_count,
+                    cancel,
+                ) {
+                    Some(n) => n,
+                    None => {
+                        if config.debug {
+                            println!("[debug] precompute_grid: gen=0 h={target_height} — nonce not found, skipping");
+                        }
+                        continue;
+                    }
+                };
+                println!(
+                    "Found nonce {nonce} in {:.2?} (precomputed gen=0 height={target_height})",
+                    grind_start.elapsed()
+                );
+
+                let bundle = match build_mining_bundle(
+                    config,
+                    &root_cat,
+                    target_height,
+                    nonce,
+                    inner_puzzle_hash,
+                    pk_bytes,
+                    sk,
+                    fee_coins,
+                    fee_puzzlehash,
+                    synthetic_sk,
+                    synthetic_pk,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("precompute_grid: gen=0 h={target_height} bundle build error: {e}");
+                        continue;
+                    }
+                };
+
+                let coin_id = root_cat.coin.coin_id();
+                println!(
+                    "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen=0)",
+                    &hex::encode(coin_id)[..16]
+                );
+                grid.push(PrecomputedBundle { target_height, target_coin_id: coin_id, bundle, nonce });
+            }
+        } else if config.debug {
+            println!(
+                "[debug] precompute_grid: gen=0 root coin amount ({}) < reward ({}), skipping root row",
+                root_cat.coin.amount, base_reward
+            );
+        }
     }
 
-    let child_amount = cat.coin.amount - current_reward;
-    let future_height = current_height + 1;
-    let future_epoch = get_epoch(future_height);
-    let future_diff_bits = get_difficulty_bits(future_epoch);
+    // --- gen=1..=COIN_GENERATIONS: spend child/grandchild/great-grandchild --
+    let mut ancestor = root_cat.clone();
+    for gen in 1..=COIN_GENERATIONS {
+        // Reward at the height the ANCESTOR is expected to be spent.
+        let base_epoch = get_epoch(current_height + (gen as u32 - 1));
+        let base_reward = get_reward(base_epoch);
 
-    let future_cat = cat.child(inner_puzzle_hash, child_amount);
+        if ancestor.coin.amount < base_reward {
+            if config.debug {
+                println!(
+                    "[debug] precompute_grid: gen={gen} coin amount ({}) < reward ({base_reward}), stopping lineage walk",
+                    ancestor.coin.amount
+                );
+            }
+            break;
+        }
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let grind_start = Instant::now();
-    let nonce = find_valid_nonce(
-        &inner_puzzle_hash,
-        pk_bytes,
-        future_height,
-        future_diff_bits,
-        MAX_NONCE_ATTEMPTS,
-        config.thread_count,
-        cancel,
-    )?;
-    println!("Found nonce {nonce} in {:.2?} (precomputed for height {future_height})", grind_start.elapsed());
+        let child_amount = ancestor.coin.amount - base_reward;
+        let child_cat = ancestor.child(inner_puzzle_hash, child_amount);
 
-    let bundle = build_mining_bundle(
-        config,
-        &future_cat,
-        future_height,
-        nonce,
-        inner_puzzle_hash,
-        pk_bytes,
-        sk,
-        fee_coins,
-        fee_puzzlehash,
-        synthetic_sk,
-        synthetic_pk,
-    )
-    .ok()?;
+        for &height_offset in &HEIGHT_OFFSETS {
+            let target_height = current_height + height_offset;
+            let epoch = get_epoch(target_height);
+            let diff_bits = get_difficulty_bits(epoch);
 
-    let coin_id = future_cat.coin.coin_id();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let grind_start = Instant::now();
+            let nonce = match find_valid_nonce(
+                &inner_puzzle_hash,
+                pk_bytes,
+                target_height,
+                diff_bits,
+                MAX_NONCE_ATTEMPTS,
+                config.thread_count,
+                cancel,
+            ) {
+                Some(n) => n,
+                None => {
+                    if config.debug {
+                        println!(
+                            "[debug] precompute_grid: gen={gen} h={target_height} — nonce not found, skipping"
+                        );
+                    }
+                    continue;
+                }
+            };
+            println!(
+                "Found nonce {nonce} in {:.2?} (precomputed gen={gen} height={target_height})",
+                grind_start.elapsed()
+            );
+
+            let bundle = match build_mining_bundle(
+                config,
+                &child_cat,
+                target_height,
+                nonce,
+                inner_puzzle_hash,
+                pk_bytes,
+                sk,
+                fee_coins,
+                fee_puzzlehash,
+                synthetic_sk,
+                synthetic_pk,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "precompute_grid: gen={gen} h={target_height} bundle build error: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            let coin_id = child_cat.coin.coin_id();
+            println!(
+                "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen={gen})",
+                &hex::encode(coin_id)[..16]
+            );
+
+            grid.push(PrecomputedBundle {
+                target_height,
+                target_coin_id: coin_id,
+                bundle,
+                nonce,
+            });
+        }
+
+        // Advance: the child becomes the new ancestor for the next generation.
+        // Use child_amount as the surviving amount after spending.
+        ancestor = child_cat;
+    }
+
     println!(
-        "Precomputed bundle ready for height {} (nonce={}, coin={}…)",
-        future_height,
-        nonce,
-        &hex::encode(coin_id)[..16]
+        "Bundle grid ready: {} entries ({} coin generations × {} heights)",
+        grid.len(),
+        COIN_GENERATIONS,
+        HEIGHT_OFFSETS.len(),
     );
-
-    Some(PrecomputedBundle {
-        target_height: future_height,
-        target_coin_id: coin_id,
-        bundle,
-        nonce,
-    })
+    grid
 }
 
 // ── Cat bootstrap helpers ──────────────────────────────────────────────
