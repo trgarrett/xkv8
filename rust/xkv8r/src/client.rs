@@ -234,6 +234,9 @@ pub struct PushTxResult {
     pub status: Option<String>,
     pub error: Option<String>,
     pub error_category: &'static str,
+    /// One entry per client: `(client_index, outcome_summary)`.
+    /// Populated on failure so callers can log per-client diagnostics.
+    pub per_client_errors: Vec<(usize, String)>,
 }
 
 fn classify_push_error(error: &str) -> &'static str {
@@ -287,10 +290,28 @@ pub async fn push_tx_to_all(
                     status: Some(tx_res.status.clone()),
                     error: None,
                     error_category: "success",
+                    per_client_errors: Vec::new(),
                 };
             }
         }
     }
+
+    // Build per-client error summary for diagnostics
+    let per_client_errors: Vec<(usize, String)> = results
+        .iter()
+        .enumerate()
+        .map(|(i, res)| {
+            let summary = match res {
+                Ok(Ok(tx_res)) => format!(
+                    "rpc_err: success={} status={:?} error={:?}",
+                    tx_res.success, tx_res.status, tx_res.error
+                ),
+                Ok(Err(e)) => format!("http_err: {e}"),
+                Err(e) => format!("join_err: {e}"),
+            };
+            (i, summary)
+        })
+        .collect();
 
     // No success — classify the primary (first) result
     match &results[0] {
@@ -301,6 +322,7 @@ pub async fn push_tx_to_all(
                 status: Some(tx_res.status.clone()),
                 error: Some(error_str.clone()),
                 error_category: classify_push_error(&error_str),
+                per_client_errors,
             }
         }
         Ok(Err(e)) => PushTxResult {
@@ -308,12 +330,14 @@ pub async fn push_tx_to_all(
             status: None,
             error: Some(format!("{e}")),
             error_category: "transport",
+            per_client_errors,
         },
         Err(e) => PushTxResult {
             success: false,
             status: None,
             error: Some(format!("{e}")),
             error_category: "transport",
+            per_client_errors,
         },
     }
 }

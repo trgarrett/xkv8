@@ -984,9 +984,21 @@ async fn mine_instant_react(
                                 } else {
                                     match result.error_category {
                                         "mempool_conflict" => {
+                                            // Already in mempool from a prior attempt — treat as
+                                            // submitted so we don't spam every block.
+                                            submitted_coins.insert(current_coin_id, target_height);
                                             if config.debug {
-                                                println!("[debug] NewPeak fire: already in mempool");
+                                                println!("[debug] NewPeak fire: already in mempool — marking as submitted");
                                             }
+                                        }
+                                        "transport" => {
+                                            // Transient network/decode error from the RPC endpoint.
+                                            // The bundle is valid; we did NOT insert into
+                                            // submitted_coins, so the next NewPeakWallet will retry.
+                                            eprintln!(
+                                                "Warning: transport error pushing bundle (will retry next block): {:?}",
+                                                result.error
+                                            );
                                         }
                                         cat => eprintln!(
                                             "NewPeak fire failed: {:?} [{cat}]",
