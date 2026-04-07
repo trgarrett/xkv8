@@ -1009,7 +1009,7 @@ async fn mine_instant_react(
 
                         // Lode coin spent
                         if coin_state.spent_height.is_some() {
-                            let we_submitted = submitted_coins.remove(&coin.coin_id()).is_some();
+                            let we_submitted = submitted_coins.contains_key(&coin.coin_id());
                             if we_submitted {
                                 check_mining_results(
                                     clients[0].as_ref(),
