@@ -1018,61 +1018,55 @@ async fn mine_instant_react(
                         println!("[debug] NewPeak {new_height}: pruned {pruned} expired grid entries ({} remain)", bundle_grid.len());
                     }
 
-                    // If the current lode coin is unspent and we have a grid entry
-                    // that spends it at this height, fire it now.  This is what
-                    // drives the chain forward when we are the sole miner (no
-                    // CoinStateUpdate ever arrives for the unspent coin).
+                    // Fire the best precomputed bundle for the current lode coin on every
+                    // new peak, regardless of whether we've submitted before.  This
+                    // ensures a lost or dropped transaction is automatically resubmitted
+                    // each block until it lands.  Duplicate submissions are cheap — the
+                    // node rejects them with mempool_conflict, which we log at debug level.
                     if let Some(ref cur_cat) = current_cat {
                         let current_coin_id = cur_cat.coin.coin_id();
-                        if !submitted_coins.contains_key(&current_coin_id) {
-                            let best = bundle_grid
-                                .iter()
-                                .filter(|p| {
-                                    p.target_coin_id == current_coin_id
-                                        && p.target_height >= new_height
-                                        && p.target_height <= new_height + 2
-                                })
-                                .min_by_key(|p| p.target_height)
-                                .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
+                        let best = bundle_grid
+                            .iter()
+                            .filter(|p| {
+                                p.target_coin_id == current_coin_id
+                                    && p.target_height >= new_height
+                                    && p.target_height <= new_height + 2
+                            })
+                            .min_by_key(|p| p.target_height)
+                            .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
 
-                            if let Some((bundle, target_height, nonce)) = best {
+                        if let Some((bundle, target_height, nonce)) = best {
+                            println!(
+                                "NewPeak {new_height}: firing precomputed bundle for current lode coin (target_height={target_height}, nonce={nonce})"
+                            );
+                            let result = push_tx_to_all(clients, &bundle).await;
+                            if result.success {
+                                submitted_coins.insert(current_coin_id, target_height);
                                 println!(
-                                    "NewPeak {new_height}: firing precomputed bundle for current lode coin (target_height={target_height}, nonce={nonce})"
+                                    "Submitted mining spend for height {target_height}, Status={:?}",
+                                    result.status
                                 );
-                                let result = push_tx_to_all(clients, &bundle).await;
-                                if result.success {
-                                    submitted_coins.insert(current_coin_id, target_height);
-                                    println!(
-                                        "Submitted mining spend for height {target_height}, Status={:?}",
-                                        result.status
-                                    );
-                                } else {
-                                    match result.error_category {
-                                        "mempool_conflict" => {
-                                            // Already in mempool from a prior attempt — treat as
-                                            // submitted so we don't spam every block.
-                                            submitted_coins.insert(current_coin_id, target_height);
-                                            if config.debug {
-                                                println!("[debug] NewPeak fire: already in mempool — marking as submitted");
-                                            }
+                            } else {
+                                match result.error_category {
+                                    "mempool_conflict" => {
+                                        submitted_coins.insert(current_coin_id, target_height);
+                                        if config.debug {
+                                            println!("[debug] NewPeak fire: already in mempool");
                                         }
-                                        "transport" => {
-                                            // Transient network/decode error from the RPC endpoint.
-                                            // The bundle is valid; we did NOT insert into
-                                            // submitted_coins, so the next NewPeakWallet will retry.
-                                            eprintln!(
-                                                "Warning: transport error pushing bundle (will retry next block): {:?}",
-                                                result.error
-                                            );
-                                            for (i, summary) in &result.per_client_errors {
-                                                eprintln!("  client[{i}]: {summary}");
-                                            }
-                                        }
-                                        cat => eprintln!(
-                                            "NewPeak fire failed: {:?} [{cat}]",
-                                            result.error
-                                        ),
                                     }
+                                    "transport" => {
+                                        eprintln!(
+                                            "Warning: transport error pushing bundle (will retry next block): {:?}",
+                                            result.error
+                                        );
+                                        for (i, summary) in &result.per_client_errors {
+                                            eprintln!("  client[{i}]: {summary}");
+                                        }
+                                    }
+                                    cat => eprintln!(
+                                        "NewPeak fire failed: {:?} [{cat}]",
+                                        result.error
+                                    ),
                                 }
                             }
                         }
