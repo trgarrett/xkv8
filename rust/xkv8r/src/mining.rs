@@ -232,6 +232,19 @@ async fn push_tx_with_retry(
         let is_pending = result.success
             && result.status.as_deref().map(|s| s.eq_ignore_ascii_case("pending")).unwrap_or(false);
         let is_not_ready = !result.success && result.error_category == "coin_not_ready";
+        let is_rate_limited = !result.success && result.error_category == "rate_limit";
+
+        if is_rate_limited {
+            eprintln!(
+                "{label}: rate limited by node (attempt {attempt}/{max_retries}), sleeping {ERROR_SLEEP_SECS}s…"
+            );
+            tokio::time::sleep(Duration::from_secs_f64(ERROR_SLEEP_SECS)).await;
+            result = push_tx_to_all(clients, bundle).await;
+            if result.success {
+                best_result = Some(result.clone());
+            }
+            continue;
+        }
 
         if !is_pending && !is_not_ready {
             break;
@@ -1118,25 +1131,44 @@ async fn mine_instant_react(
                     // node rejects them with mempool_conflict, which we log at debug level.
                     if let Some(ref cur_cat) = current_cat {
                         let current_coin_id = cur_cat.coin.coin_id();
-                        let best = bundle_grid
-                            .iter()
-                            .filter(|p| {
-                                p.target_coin_id == current_coin_id
-                                    && p.target_height >= new_height
-                                    && p.target_height <= new_height + 2
-                            })
-                            .min_by_key(|p| p.target_height)
-                            .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
 
-                        if let Some((bundle, target_height, nonce)) = best {
+                        // If we have already submitted a spend for the current coin, racing on
+                        // it again would be a double-spend.  Instead look for the child coin in
+                        // the precomputed grid (gen=1+ entries whose target_coin_id differs from
+                        // the coin we already spent).
+                        let already_submitted = submitted_coins.contains_key(&current_coin_id);
+                        let best = if already_submitted {
+                            bundle_grid
+                                .iter()
+                                .filter(|p| {
+                                    p.target_coin_id != current_coin_id
+                                        && p.target_height >= new_height
+                                        && p.target_height <= new_height + 2
+                                })
+                                .min_by_key(|p| p.target_height)
+                                .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
+                        } else {
+                            bundle_grid
+                                .iter()
+                                .filter(|p| {
+                                    p.target_coin_id == current_coin_id
+                                        && p.target_height >= new_height
+                                        && p.target_height <= new_height + 2
+                                })
+                                .min_by_key(|p| p.target_height)
+                                .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
+                        };
+
+                        if let Some((bundle, target_height, nonce, race_coin_id)) = best {
+                            let race_label = if already_submitted { "child coin" } else { "current lode coin" };
                             println!(
-                                "NewPeak {new_height}: firing precomputed bundle for current lode coin (coin_id={}, target_height={target_height}, nonce={nonce})",
-                                hex::encode(current_coin_id)
+                                "NewPeak {new_height}: firing precomputed bundle for {race_label} (coin_id={}, target_height={target_height}, nonce={nonce})",
+                                hex::encode(race_coin_id)
                             );
                             let label = format!("NewPeak h={new_height} target={target_height}");
                             let result = push_tx_with_retry(clients, &bundle, &label, config).await;
                             if result.success {
-                                submitted_coins.insert(current_coin_id, target_height);
+                                submitted_coins.insert(race_coin_id, target_height);
                                 println!(
                                     "Submitted mining spend for height {target_height}, Status={:?}",
                                     result.status
@@ -1144,7 +1176,7 @@ async fn mine_instant_react(
                             } else {
                                 match result.error_category {
                                     "mempool_conflict" => {
-                                        submitted_coins.insert(current_coin_id, target_height);
+                                        submitted_coins.insert(race_coin_id, target_height);
                                         if config.debug {
                                             println!("[debug] NewPeak fire: already in mempool");
                                         }

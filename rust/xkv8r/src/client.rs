@@ -383,6 +383,12 @@ fn classify_push_error(error: &str) -> &'static str {
     {
         return "fee_issue";
     }
+    if ["TOO MANY REQUESTS", "RATE_LIMIT", "RATE LIMIT", "FULLNODE_RATE_LIMIT"]
+        .iter()
+        .any(|kw| upper.contains(kw))
+    {
+        return "rate_limit";
+    }
     "unknown"
 }
 
