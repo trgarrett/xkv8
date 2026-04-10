@@ -393,8 +393,6 @@ async fn poll_once(
                 &config.target_address,
             )
             .await;
-            // (polling loop re-fetches the lode coin each iteration, so no
-            // special handling needed here for the won-coin list)
         }
     }
 
@@ -706,11 +704,6 @@ async fn mine_instant_react(
 
     let mut submitted_coins: SubmittedCoins = HashMap::new();
     let mut current_cat: Option<Cat> = Some(initial_cat);
-    // Tracks whether current_cat is confirmed on-chain (true) or speculatively
-    // advanced after a win (false, child coin not yet indexed by the node).
-    // NewPeakWallet only fires gen=0 bundles when this is true; firing for a
-    // speculative child causes UNKNOWN_UNSPENT spam until the child confirms.
-    let mut current_cat_confirmed: bool = true;
     let mut current_height = height;
 
     // Fetch initial fee coins
@@ -853,11 +846,6 @@ async fn mine_instant_react(
                                 &hex::encode(coin.coin_id()),
                                 coin.amount
                             );
-                            // Mark confirmed — NewPeakWallet may now fire for this coin.
-                            if current_cat.as_ref().map(|c| c.coin.coin_id()) == Some(coin.coin_id()) {
-                                current_cat_confirmed = true;
-                            }
-
                             // Look for the best grid entry: matching coin_id, LOWEST
                             // target_height that is still valid (>= update_height and
                             // within the 3-block window).  As sole miner the coin
@@ -1037,7 +1025,6 @@ async fn mine_instant_react(
                                             }
                                         }
                                         current_cat = Some(fresh_cat);
-                                        current_cat_confirmed = true;
                                     }
                                 }
                             }
@@ -1056,11 +1043,16 @@ async fn mine_instant_react(
                             .await
                             {
                                 current_cat = Some(confirmed_cat);
-                                current_cat_confirmed = true;
                             }
                             // If bootstrap fails, keep whatever we had; the existing grid is
                             // still valid for the current coin.
                             current_height = current_height.max(update_height);
+
+                            // Refresh fee coins before grid rebuild — the previous
+                            // spend may have consumed a fee coin.
+                            if config.fee_mojos > 0 {
+                                fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
+                            }
 
                             // Rebuild the 3×3 grid off the Tokio thread so the
                             // peer receive loop is never blocked by nonce grinding.
@@ -1084,11 +1076,16 @@ async fn mine_instant_react(
                             }
                         }
 
-                        // Lode coin spent
+                        // Lode coin spent — log win/loss but do NOT advance current_cat.
+                        // The child coin is deterministic (same coin_id regardless of who
+                        // mined it) and the grid's gen=1+ entries already cover it.
+                        // CoinStateUpdate for the child coin will fire the precomputed
+                        // bundle and advance current_cat when it arrives.
                         if coin_state.spent_height.is_some() {
+                            let spent_h = coin_state.spent_height.unwrap_or(update_height);
                             let we_submitted = submitted_coins.contains_key(&coin.coin_id());
                             if we_submitted {
-                                let won = check_mining_results(
+                                check_mining_results(
                                     clients[0].as_ref(),
                                     inner_puzzle_hash,
                                     &mut submitted_coins,
@@ -1096,109 +1093,11 @@ async fn mine_instant_react(
                                     &config.target_address,
                                 )
                                 .await;
-                                // If we won, advance current_cat to the child coin so
-                                // NewPeakWallet stops firing bundles for the spent parent.
-                                // The CoinStateUpdate for the child may arrive several blocks
-                                // later; advancing here prevents stale-bundle spam in the gap.
-                                if won.contains(&coin.coin_id()) {
-                                    if let Some(ref cur) = current_cat {
-                                        let spent_h = coin_state.spent_height.unwrap_or(update_height);
-                                        let epoch = get_epoch(spent_h);
-                                        let reward_val = get_reward(epoch);
-                                        let child_amount = cur.coin.amount.saturating_sub(reward_val);
-                                        let child_cat = cur.child(inner_puzzle_hash, child_amount);
-                                        println!(
-                                            "Win detected — advancing current_cat to child coin_id={}…, amount={}",
-                                            &hex::encode(child_cat.coin.coin_id()),
-                                            child_cat.coin.amount
-                                        );
-                                        current_height = current_height.max(spent_h);
-                                        current_cat = Some(child_cat);
-                                        // Child coin is speculative until CoinStateUpdate confirms it.
-                                        // NewPeakWallet must not fire for it until then.
-                                        current_cat_confirmed = false;
-                                        // Purge stale grid entries for the old (now-spent) coin
-                                        bundle_grid.retain(|p| p.target_coin_id != coin.coin_id());
-                                        // The fee coin was consumed in the winning spend — re-fetch
-                                        // fresh fee coins so the grid rebuild doesn't try to reuse
-                                        // the already-spent fee coin.
-                                        if config.fee_mojos > 0 {
-                                            fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
-                                            if fee_coins.is_empty() {
-                                                eprintln!("Warning: no fee coins available after win — grid will be built without fee");
-                                            } else {
-                                                println!("Refreshed {} fee coin(s) after win", fee_coins.len());
-                                            }
-                                        }
-                                        // Rebuild grid off-thread for the new child coin
-                                        let cfg = config.clone();
-                                        let cat = current_cat.clone();
-                                        let iph = inner_puzzle_hash;
-                                        let pkb = *pk_bytes;
-                                        let sk2 = sk.clone();
-                                        let fph = fee_puzzlehash;
-                                        let ssk = synthetic_sk.clone();
-                                        let spk = *synthetic_pk;
-                                        let fc = fee_coins.clone();
-                                        let ch = current_height;
-                                        bundle_grid = tokio::task::spawn_blocking(move || {
-                                            precompute_bundle_grid(
-                                                &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
-                                            )
-                                        })
-                                        .await?;
-                                    }
-                                }
                             } else {
-                                // Another miner spent this coin.  Re-bootstrap current_cat
-                                // from RPC so the next grid is rooted at the actual chain tip.
-                                let spent_h = coin_state.spent_height.unwrap_or(update_height);
                                 println!(
-                                    "Lode coin {}… spent by another miner at height {spent_h} — re-bootstrapping lineage",
+                                    "Lode coin {}… spent by another miner at height {spent_h}",
                                     &hex::encode(coin.coin_id())
                                 );
-                                match bootstrap_cat_from_rpc(
-                                    clients,
-                                    full_cat_ph,
-                                    inner_puzzle_hash,
-                                    spent_h,
-                                )
-                                .await
-                                {
-                                    Ok(Some(new_cat)) => {
-                                        println!(
-                                            "Re-bootstrapped Cat: coin_id={}…, amount={}",
-                                            &hex::encode(new_cat.coin.coin_id()),
-                                            new_cat.coin.amount
-                                        );
-                                        current_height = current_height.max(spent_h);
-                                        current_cat = Some(new_cat);
-                                        current_cat_confirmed = true;
-                                        // Rebuild grid from the new root off-thread
-                                        let cfg = config.clone();
-                                        let cat = current_cat.clone();
-                                        let iph = inner_puzzle_hash;
-                                        let pkb = *pk_bytes;
-                                        let sk2 = sk.clone();
-                                        let fph = fee_puzzlehash;
-                                        let ssk = synthetic_sk.clone();
-                                        let spk = *synthetic_pk;
-                                        let fc = fee_coins.clone();
-                                        let ch = current_height;
-                                        bundle_grid = tokio::task::spawn_blocking(move || {
-                                            precompute_bundle_grid(
-                                                &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
-                                            )
-                                        })
-                                        .await?;
-                                    }
-                                    Ok(None) => {
-                                        eprintln!("Re-bootstrap failed: no unspent lode coin found after rival spend at height {spent_h}");
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Re-bootstrap error after rival spend: {e}");
-                                    }
-                                }
                             }
                         }
                     }
@@ -1258,7 +1157,7 @@ async fn mine_instant_react(
                         let current_coin_id = cur_cat.coin.coin_id();
                         let already_submitted = submitted_coins.contains_key(&current_coin_id);
 
-                        if !already_submitted && current_cat_confirmed {
+                        if !already_submitted {
                             let best = bundle_grid
                                 .iter()
                                 .filter(|p| {
@@ -1342,7 +1241,7 @@ async fn mine_instant_react(
                     }
 
                     if !submitted_coins.is_empty() {
-                        let won = check_mining_results(
+                        check_mining_results(
                             clients[0].as_ref(),
                             inner_puzzle_hash,
                             &mut submitted_coins,
@@ -1350,58 +1249,10 @@ async fn mine_instant_react(
                             &config.target_address,
                         )
                         .await;
-
-                        // If we just confirmed a win for the current lode coin, advance
-                        // current_cat to the child immediately so subsequent NewPeakWallet
-                        // events don't keep firing bundles for the already-spent parent.
-                        if let Some(ref cur) = current_cat {
-                            let cur_coin_id = cur.coin.coin_id();
-                            if won.contains(&cur_coin_id) {
-                                let epoch = get_epoch(new_height);
-                                let reward_val = get_reward(epoch);
-                                let child_amount = cur.coin.amount.saturating_sub(reward_val);
-                                let child_cat = cur.child(inner_puzzle_hash, child_amount);
-                                println!(
-                                    "Win detected (NewPeak) — advancing current_cat to child coin_id={}…, amount={}",
-                                    &hex::encode(child_cat.coin.coin_id()),
-                                    child_cat.coin.amount
-                                );
-                                current_cat = Some(child_cat);
-                                // Child coin is speculative until CoinStateUpdate confirms it.
-                                // NewPeakWallet must not fire for it until then.
-                                current_cat_confirmed = false;
-                                // Purge stale grid entries for the old (now-spent) coin
-                                bundle_grid.retain(|p| p.target_coin_id != cur_coin_id);
-                                // The fee coin was consumed in the winning spend — re-fetch
-                                // fresh fee coins so the grid rebuild doesn't try to reuse
-                                // the already-spent fee coin.
-                                if config.fee_mojos > 0 {
-                                    fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
-                                    if fee_coins.is_empty() {
-                                        eprintln!("Warning: no fee coins available after win — grid will be built without fee");
-                                    } else {
-                                        println!("Refreshed {} fee coin(s) after win", fee_coins.len());
-                                    }
-                                }
-                                // Rebuild grid off-thread for the new child coin
-                                let cfg = config.clone();
-                                let cat = current_cat.clone();
-                                let iph = inner_puzzle_hash;
-                                let pkb = *pk_bytes;
-                                let sk2 = sk.clone();
-                                let fph = fee_puzzlehash;
-                                let ssk = synthetic_sk.clone();
-                                let spk = *synthetic_pk;
-                                let fc = fee_coins.clone();
-                                let ch = current_height;
-                                bundle_grid = tokio::task::spawn_blocking(move || {
-                                    precompute_bundle_grid(
-                                        &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
-                                    )
-                                })
-                                .await?;
-                            }
-                        }
+                        // Don't advance current_cat here — the child coin is
+                        // deterministic and the grid's gen=1+ entries cover it.
+                        // CoinStateUpdate will fire the precomputed bundle and
+                        // advance current_cat when the child coin is confirmed.
                     }
                 }
             }
@@ -1805,20 +1656,15 @@ async fn fetch_fee_coins(
 
 // ── Mining result checking ─────────────────────────────────────────────
 
-/// Check submitted coins for confirmed results.
-///
-/// Returns the list of coin IDs that were confirmed as **our wins** so the
-/// caller can advance `current_cat` and rebuild the bundle grid immediately,
-/// rather than waiting for the next `CoinStateUpdate`.
+/// Check submitted coins for confirmed results (win/loss logging).
 async fn check_mining_results(
     client: &dyn RpcClient,
     _inner_puzzle_hash: Bytes32,
     submitted_coins: &mut SubmittedCoins,
     target_puzzlehash: &Bytes32,
     target_address: &str,
-) -> Vec<Bytes32> {
+) {
     let mut to_remove = Vec::new();
-    let mut won_coins: Vec<Bytes32> = Vec::new();
     let snapshot: Vec<(Bytes32, u32)> = submitted_coins.iter().map(|(&k, &v)| (k, v)).collect();
 
     for (coin_id, sub_height) in snapshot {
@@ -1880,7 +1726,6 @@ async fn check_mining_results(
                                                     "Reward of {reward_cat:.3} XKV8 sent to {target_address}"
                                                 );
                                                 println!();
-                                                won_coins.push(coin_id);
                                             } else {
                                                 println!(
                                                     "Coin submitted at height {} was mined by another miner at height {}",
@@ -1913,7 +1758,6 @@ async fn check_mining_results(
         submitted_coins.remove(&coin_id);
     }
 
-    won_coins
 }
 
 // ── Helper: extract peer host ──────────────────────────────────────────
