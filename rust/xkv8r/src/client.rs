@@ -71,19 +71,56 @@ async fn push_tx_raw(
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = response.status();
+    let http_status = response.status();
     let raw = response
         .bytes()
         .await
         .with_context(|| format!("reading response body from {url}"))?;
 
-    serde_json::from_slice::<PushTxResponse>(&raw).map_err(|json_err| {
-        // Produce a human-readable snippet of whatever the server actually sent.
-        let snippet = String::from_utf8_lossy(raw.get(..RAW_BODY_SNIPPET_LEN.min(raw.len())).unwrap_or(&raw));
-        anyhow::anyhow!(
-            "error decoding response body from {url} (HTTP {status}): {json_err}\n  raw body: {snippet}"
-        )
-    })
+    // Primary parse: the happy-path response includes `status`.
+    if let Ok(parsed) = serde_json::from_slice::<PushTxResponse>(&raw) {
+        return Ok(parsed);
+    }
+
+    // Fallback parse: the Chia full node and some API proxies return error
+    // bodies that omit the `status` field (e.g. UNKNOWN_UNSPENT, rate-limit
+    // 429s).  Deserialising those as a partial object lets us synthesise a
+    // proper PushTxResponse so the caller can classify and retry correctly
+    // instead of treating every such response as an opaque transport error.
+    #[derive(serde::Deserialize)]
+    struct PartialPushTx {
+        success: Option<bool>,
+        error: Option<String>,
+        // coinset.org rate-limit bodies use `limit_reason` instead of `error`
+        limit_reason: Option<String>,
+        limit_message: Option<String>,
+    }
+
+    if let Ok(partial) = serde_json::from_slice::<PartialPushTx>(&raw) {
+        let success = partial.success.unwrap_or(false);
+        // Prefer `error`, fall back to `limit_reason` / `limit_message`
+        let error = partial
+            .error
+            .or_else(|| partial.limit_reason.clone())
+            .or(partial.limit_message);
+        return Ok(PushTxResponse {
+            status: if success {
+                "SUCCESS".to_string()
+            } else {
+                "FAILED".to_string()
+            },
+            error,
+            success,
+        });
+    }
+
+    // Nothing worked — surface the raw body in the error message.
+    let snippet = String::from_utf8_lossy(
+        raw.get(..RAW_BODY_SNIPPET_LEN.min(raw.len())).unwrap_or(&raw),
+    );
+    Err(anyhow::anyhow!(
+        "error decoding response body from {url} (HTTP {http_status}): unrecognised response shape\n  raw body: {snippet}"
+    ))
 }
 
 // ── Abstract client wrapper ────────────────────────────────────────────
