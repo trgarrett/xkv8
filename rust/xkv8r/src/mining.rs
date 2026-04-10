@@ -706,6 +706,11 @@ async fn mine_instant_react(
 
     let mut submitted_coins: SubmittedCoins = HashMap::new();
     let mut current_cat: Option<Cat> = Some(initial_cat);
+    // Tracks whether current_cat is confirmed on-chain (true) or speculatively
+    // advanced after a win (false, child coin not yet indexed by the node).
+    // NewPeakWallet only fires gen=0 bundles when this is true; firing for a
+    // speculative child causes UNKNOWN_UNSPENT spam until the child confirms.
+    let mut current_cat_confirmed: bool = true;
     let mut current_height = height;
 
     // Fetch initial fee coins
@@ -848,6 +853,10 @@ async fn mine_instant_react(
                                 &hex::encode(coin.coin_id()),
                                 coin.amount
                             );
+                            // Mark confirmed — NewPeakWallet may now fire for this coin.
+                            if current_cat.as_ref().map(|c| c.coin.coin_id()) == Some(coin.coin_id()) {
+                                current_cat_confirmed = true;
+                            }
 
                             // Look for the best grid entry: matching coin_id, LOWEST
                             // target_height that is still valid (>= update_height and
@@ -1028,6 +1037,7 @@ async fn mine_instant_react(
                                             }
                                         }
                                         current_cat = Some(fresh_cat);
+                                        current_cat_confirmed = true;
                                     }
                                 }
                             }
@@ -1046,6 +1056,7 @@ async fn mine_instant_react(
                             .await
                             {
                                 current_cat = Some(confirmed_cat);
+                                current_cat_confirmed = true;
                             }
                             // If bootstrap fails, keep whatever we had; the existing grid is
                             // still valid for the current coin.
@@ -1103,6 +1114,9 @@ async fn mine_instant_react(
                                         );
                                         current_height = current_height.max(spent_h);
                                         current_cat = Some(child_cat);
+                                        // Child coin is speculative until CoinStateUpdate confirms it.
+                                        // NewPeakWallet must not fire for it until then.
+                                        current_cat_confirmed = false;
                                         // Purge stale grid entries for the old (now-spent) coin
                                         bundle_grid.retain(|p| p.target_coin_id != coin.coin_id());
                                         // The fee coin was consumed in the winning spend — re-fetch
@@ -1159,6 +1173,7 @@ async fn mine_instant_react(
                                         );
                                         current_height = current_height.max(spent_h);
                                         current_cat = Some(new_cat);
+                                        current_cat_confirmed = true;
                                         // Rebuild grid from the new root off-thread
                                         let cfg = config.clone();
                                         let cat = current_cat.clone();
@@ -1243,7 +1258,7 @@ async fn mine_instant_react(
                         let current_coin_id = cur_cat.coin.coin_id();
                         let already_submitted = submitted_coins.contains_key(&current_coin_id);
 
-                        if !already_submitted {
+                        if !already_submitted && current_cat_confirmed {
                             let best = bundle_grid
                                 .iter()
                                 .filter(|p| {
@@ -1352,6 +1367,9 @@ async fn mine_instant_react(
                                     child_cat.coin.amount
                                 );
                                 current_cat = Some(child_cat);
+                                // Child coin is speculative until CoinStateUpdate confirms it.
+                                // NewPeakWallet must not fire for it until then.
+                                current_cat_confirmed = false;
                                 // Purge stale grid entries for the old (now-spent) coin
                                 bundle_grid.retain(|p| p.target_coin_id != cur_coin_id);
                                 // The fee coin was consumed in the winning spend — re-fetch
