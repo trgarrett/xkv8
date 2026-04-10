@@ -1105,6 +1105,17 @@ async fn mine_instant_react(
                                         current_cat = Some(child_cat);
                                         // Purge stale grid entries for the old (now-spent) coin
                                         bundle_grid.retain(|p| p.target_coin_id != coin.coin_id());
+                                        // The fee coin was consumed in the winning spend — re-fetch
+                                        // fresh fee coins so the grid rebuild doesn't try to reuse
+                                        // the already-spent fee coin.
+                                        if config.fee_mojos > 0 {
+                                            fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
+                                            if fee_coins.is_empty() {
+                                                eprintln!("Warning: no fee coins available after win — grid will be built without fee");
+                                            } else {
+                                                println!("Refreshed {} fee coin(s) after win", fee_coins.len());
+                                            }
+                                        }
                                         // Rebuild grid off-thread for the new child coin
                                         let cfg = config.clone();
                                         let cat = current_cat.clone();
@@ -1343,6 +1354,17 @@ async fn mine_instant_react(
                                 current_cat = Some(child_cat);
                                 // Purge stale grid entries for the old (now-spent) coin
                                 bundle_grid.retain(|p| p.target_coin_id != cur_coin_id);
+                                // The fee coin was consumed in the winning spend — re-fetch
+                                // fresh fee coins so the grid rebuild doesn't try to reuse
+                                // the already-spent fee coin.
+                                if config.fee_mojos > 0 {
+                                    fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
+                                    if fee_coins.is_empty() {
+                                        eprintln!("Warning: no fee coins available after win — grid will be built without fee");
+                                    } else {
+                                        println!("Refreshed {} fee coin(s) after win", fee_coins.len());
+                                    }
+                                }
                                 // Rebuild grid off-thread for the new child coin
                                 let cfg = config.clone();
                                 let cat = current_cat.clone();
