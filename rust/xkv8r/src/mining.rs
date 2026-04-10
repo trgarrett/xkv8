@@ -949,10 +949,14 @@ async fn mine_instant_react(
                             }
                         }
                         "mempool_conflict" => {
-                            submitted_coins.insert(rpc_coin_id, target_height);
-                            if config.debug {
-                                println!("[debug] Rival spend in mempool, marking submitted");
-                            }
+                            // A rival spend is in the mempool for this coin.
+                            // Do NOT mark as submitted — keep firing on each
+                            // subsequent NewPeak.  The rival's spend may target
+                            // a specific height that expires as the chain
+                            // advances, allowing our bundle to take over.
+                            println!(
+                                "Mempool conflict at height {current_height} (rival in mempool) — will retry next peak"
+                            );
                         }
                         "transport" => {
                             eprintln!(

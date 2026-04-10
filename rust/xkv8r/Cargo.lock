@@ -4139,7 +4139,7 @@ dependencies = [
 
 [[package]]
 name = "xkv8r"
-version = "0.1.5-rs"
+version = "0.1.6-rs"
 dependencies = [
  "anyhow",
  "async-trait",
