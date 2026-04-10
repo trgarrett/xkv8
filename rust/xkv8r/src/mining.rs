@@ -894,9 +894,11 @@ async fn mine_instant_react(
         }
 
         // ── Fire best precomputed bundle ─────────────────────────
-        let already_submitted = submitted_coins.contains_key(&rpc_coin_id);
-
-        if !already_submitted {
+        // Always fire on every NewPeak, even if we previously submitted
+        // for this coin.  This ensures our target height stays fresh —
+        // if the chain advances past our previous target, the old spend
+        // ages out of the mempool and we need a replacement immediately.
+        {
             let best = bundle_grid
                 .iter()
                 .filter(|p| {
@@ -915,13 +917,11 @@ async fn mine_instant_react(
                 let label = format!("NewPeak h={current_height} target={target_height}");
                 let result = push_tx_with_retry(clients, &bundle, &label, config).await;
                 if result.success {
+                    // Track for win/loss detection, but do NOT mark as
+                    // known-spent or purge grid — we keep firing fresh
+                    // heights on each subsequent peak so our spend never
+                    // ages out of the mempool.
                     submitted_coins.insert(rpc_coin_id, target_height);
-                    // Our spend is now in the mempool — the coin will be
-                    // spent once confirmed.  Mark it as known-spent so we
-                    // don't keep firing stale bundles if RPC is slow to
-                    // reflect the change.
-                    known_spent_coins.insert(rpc_coin_id);
-                    bundle_grid.retain(|p| p.target_coin_id != rpc_coin_id);
                     println!(
                         "Submitted mining spend for height {target_height}, Status={:?}",
                         result.status
@@ -949,14 +949,14 @@ async fn mine_instant_react(
                             }
                         }
                         "mempool_conflict" => {
-                            // A rival spend is in the mempool for this coin.
-                            // Do NOT mark as submitted — keep firing on each
-                            // subsequent NewPeak.  The rival's spend may target
-                            // a specific height that expires as the chain
-                            // advances, allowing our bundle to take over.
-                            println!(
-                                "Mempool conflict at height {current_height} (rival in mempool) — will retry next peak"
-                            );
+                            // Our own or a rival spend is already in the
+                            // mempool.  Keep firing on subsequent peaks —
+                            // the existing entry may age out.
+                            if config.debug {
+                                println!(
+                                    "[debug] Mempool conflict at height {current_height} — will retry next peak"
+                                );
+                            }
                         }
                         "transport" => {
                             eprintln!(
