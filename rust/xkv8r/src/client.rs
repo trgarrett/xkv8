@@ -402,7 +402,12 @@ pub struct PushTxResult {
 
 fn classify_push_error(error: &str) -> &'static str {
     let upper = error.to_uppercase();
-    if ["DOUBLE_SPEND", "ALREADY_INCLUDING", "CONFLICTING"]
+    // DOUBLE_SPEND means the coin is already spent on-chain (confirmed).
+    // This is distinct from a mempool conflict where a rival tx is pending.
+    if upper.contains("DOUBLE_SPEND") {
+        return "already_spent";
+    }
+    if ["ALREADY_INCLUDING", "CONFLICTING"]
         .iter()
         .any(|kw| upper.contains(kw))
     {

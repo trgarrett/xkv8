@@ -527,6 +527,15 @@ async fn poll_once(
         );
     } else {
         match result.error_category {
+            "already_spent" => {
+                // Coin already confirmed-spent on-chain — a rival won.
+                // Don't insert into submitted_coins; let check_mining_results
+                // detect the loss on the next new height.
+                eprintln!(
+                    "Polling push rejected: coin {} already spent on-chain (rival win) at height {mine_height}",
+                    hex::encode(coin_id_key)
+                );
+            }
             "transport" => {
                 eprintln!(
                     "Failed to push tx (transport error) for coin {} at height {mine_height}: {:?}",
@@ -540,7 +549,7 @@ async fn poll_once(
             "mempool_conflict" => {
                 if config.debug {
                     println!(
-                        "[debug] Submit skipped (already in mempool) for height {mine_height}: {:?}",
+                        "[debug] Submit skipped (rival spend in mempool) for height {mine_height}: {:?}",
                         result.error
                     );
                 }
@@ -868,14 +877,38 @@ async fn mine_instant_react(
                                         target_height, result.status
                                     );
                                 } else {
-                                    eprintln!(
-                                        "Precomputed push failed: {:?} [{}]",
-                                        result.error, result.error_category
-                                    );
-                                    if result.error_category == "transport" {
-                                        for (i, summary) in &result.per_client_errors {
-                                            eprintln!("  client[{i}]: {summary}");
+                                    match result.error_category {
+                                        "already_spent" => {
+                                            // The coin is already spent on-chain — a rival confirmed
+                                            // a spend before us.  Remove from submitted_coins so
+                                            // check_mining_results can detect the loss, and stop
+                                            // firing bundles for this dead coin.
+                                            submitted_coins.remove(&coin.coin_id());
+                                            eprintln!(
+                                                "Precomputed push rejected: coin already spent on-chain (rival win)"
+                                            );
                                         }
+                                        "mempool_conflict" => {
+                                            // A rival has a pending spend for this coin in the
+                                            // mempool.  Mark it submitted so we don't keep firing.
+                                            submitted_coins.insert(coin.coin_id(), target_height);
+                                            if config.debug {
+                                                println!("[debug] Precomputed push: rival spend in mempool, marking submitted");
+                                            }
+                                        }
+                                        "transport" => {
+                                            eprintln!(
+                                                "Precomputed push failed (transport): {:?}",
+                                                result.error
+                                            );
+                                            for (i, summary) in &result.per_client_errors {
+                                                eprintln!("  client[{i}]: {summary}");
+                                            }
+                                        }
+                                        cat => eprintln!(
+                                            "Precomputed push failed: {:?} [{cat}]",
+                                            result.error
+                                        ),
                                     }
                                 }
                             } else {
@@ -959,11 +992,29 @@ async fn mine_instant_react(
                                                             .insert(coin.coin_id(), fresh_height);
                                                         println!("Submitted fresh mining spend for height {fresh_height}, Status={:?}", result.status);
                                                     } else {
-                                                        eprintln!("Fresh push failed: {:?} [{}]", result.error, result.error_category);
-                                                        if result.error_category == "transport" {
-                                                            for (i, summary) in &result.per_client_errors {
-                                                                eprintln!("  client[{i}]: {summary}");
+                                                        match result.error_category {
+                                                            "already_spent" => {
+                                                                submitted_coins.remove(&coin.coin_id());
+                                                                eprintln!(
+                                                                    "Fresh push rejected: coin already spent on-chain (rival win)"
+                                                                );
                                                             }
+                                                            "mempool_conflict" => {
+                                                                submitted_coins.insert(coin.coin_id(), fresh_height);
+                                                                if config.debug {
+                                                                    println!("[debug] Fresh push: rival spend in mempool, marking submitted");
+                                                                }
+                                                            }
+                                                            "transport" => {
+                                                                eprintln!("Fresh push failed (transport): {:?}", result.error);
+                                                                for (i, summary) in &result.per_client_errors {
+                                                                    eprintln!("  client[{i}]: {summary}");
+                                                                }
+                                                            }
+                                                            cat => eprintln!(
+                                                                "Fresh push failed: {:?} [{cat}]",
+                                                                result.error
+                                                            ),
                                                         }
                                                     }
                                                 }
@@ -1166,10 +1217,19 @@ async fn mine_instant_react(
                                     );
                                 } else {
                                     match result.error_category {
+                                        "already_spent" => {
+                                            // Coin already spent on-chain — rival confirmed before us.
+                                            // Remove from submitted_coins so check_mining_results
+                                            // can detect the loss on the next new peak.
+                                            submitted_coins.remove(&race_coin_id);
+                                            eprintln!(
+                                                "NewPeak fire rejected: coin already spent on-chain (rival win)"
+                                            );
+                                        }
                                         "mempool_conflict" => {
                                             submitted_coins.insert(race_coin_id, target_height);
                                             if config.debug {
-                                                println!("[debug] NewPeak fire: already in mempool");
+                                                println!("[debug] NewPeak fire: rival spend in mempool, marking submitted");
                                             }
                                         }
                                         "transport" => {
