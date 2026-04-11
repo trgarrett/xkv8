@@ -925,7 +925,15 @@ async fn mine_instant_react(
                     if rpc_coin_is_spent { " [descendant]" } else { "" }
                 );
                 let label = format!("NewPeak h={current_height} target={target_height}");
-                let result = push_tx_with_retry(clients, &bundle, &label, config).await;
+                // For descendant coins (parent known-spent), the child may
+                // not be indexed yet.  Use a single attempt without retries
+                // to avoid blocking on UNKNOWN_UNSPENT — the next NewPeak
+                // will try again once the node has caught up.
+                let result = if rpc_coin_is_spent {
+                    push_tx_to_all(clients, &bundle).await
+                } else {
+                    push_tx_with_retry(clients, &bundle, &label, config).await
+                };
                 if result.success {
                     // Track for win/loss detection, but do NOT mark as
                     // known-spent or purge grid — we keep firing fresh
@@ -978,6 +986,15 @@ async fn mine_instant_react(
                             );
                             for (i, summary) in &result.per_client_errors {
                                 eprintln!("  client[{i}]: {summary}");
+                            }
+                        }
+                        "coin_not_ready" => {
+                            // Child coin not indexed yet — expected for
+                            // descendants.  Will retry on next NewPeak.
+                            if config.debug {
+                                println!(
+                                    "[debug] Coin not ready (UNKNOWN_UNSPENT) — will retry next peak"
+                                );
                             }
                         }
                         cat => eprintln!("Push failed: {:?} [{cat}]", result.error),
