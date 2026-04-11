@@ -864,17 +864,7 @@ async fn mine_instant_react(
             current_cat = Some(rpc_cat.clone());
         }
 
-        // If RPC is stale and still returning a coin we know is spent,
-        // skip all firing and grid rebuilding until a fresh coin appears.
-        if known_spent_coins.contains(&rpc_coin_id) {
-            if config.debug {
-                println!(
-                    "[debug] Height {current_height}: RPC still returning known-spent coin {}… — waiting for fresh coin",
-                    &hex::encode(rpc_coin_id)
-                );
-            }
-            continue;
-        }
+        let rpc_coin_is_spent = known_spent_coins.contains(&rpc_coin_id);
 
         // Prune grid entries whose target_height is below the current height
         // (they can no longer land in a valid block).
@@ -898,21 +888,41 @@ async fn mine_instant_react(
         // for this coin.  This ensures our target height stays fresh —
         // if the chain advances past our previous target, the old spend
         // ages out of the mempool and we need a replacement immediately.
+        //
+        // When the RPC coin is known-spent, we fire the best DESCENDANT
+        // entry from the grid (gen=1+) instead — these target child coins
+        // that should appear once the on-chain spend confirms.
         {
-            let best = bundle_grid
-                .iter()
-                .filter(|p| {
-                    p.target_coin_id == rpc_coin_id
-                        && p.target_height >= current_height
-                        && p.target_height <= current_height + 2
-                })
-                .min_by_key(|p| p.target_height)
-                .map(|p| (p.bundle.clone(), p.target_height, p.nonce));
+            let best = if rpc_coin_is_spent {
+                // RPC is stale — fire best descendant entry (any coin_id
+                // that isn't the spent one).
+                bundle_grid
+                    .iter()
+                    .filter(|p| {
+                        p.target_coin_id != rpc_coin_id
+                            && p.target_height >= current_height
+                            && p.target_height <= current_height + 2
+                    })
+                    .min_by_key(|p| p.target_height)
+                    .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
+            } else {
+                // Normal path — fire entry matching the current RPC coin.
+                bundle_grid
+                    .iter()
+                    .filter(|p| {
+                        p.target_coin_id == rpc_coin_id
+                            && p.target_height >= current_height
+                            && p.target_height <= current_height + 2
+                    })
+                    .min_by_key(|p| p.target_height)
+                    .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
+            };
 
-            if let Some((bundle, target_height, nonce)) = best {
+            if let Some((bundle, target_height, nonce, fire_coin_id)) = best {
                 println!(
-                    "NewPeak {current_height}: firing precomputed bundle (target_height={target_height}, nonce={nonce}, coin={}…)",
-                    &hex::encode(rpc_coin_id)
+                    "NewPeak {current_height}: firing precomputed bundle (target_height={target_height}, nonce={nonce}, coin={}…{})",
+                    &hex::encode(fire_coin_id),
+                    if rpc_coin_is_spent { " [descendant]" } else { "" }
                 );
                 let label = format!("NewPeak h={current_height} target={target_height}");
                 let result = push_tx_with_retry(clients, &bundle, &label, config).await;
@@ -921,7 +931,7 @@ async fn mine_instant_react(
                     // known-spent or purge grid — we keep firing fresh
                     // heights on each subsequent peak so our spend never
                     // ages out of the mempool.
-                    submitted_coins.insert(rpc_coin_id, target_height);
+                    submitted_coins.insert(fire_coin_id, target_height);
                     println!(
                         "Submitted mining spend for height {target_height}, Status={:?}",
                         result.status
@@ -930,12 +940,15 @@ async fn mine_instant_react(
                     match result.error_category {
                         "already_spent" => {
                             // Coin confirmed-spent on-chain (our win or rival).
-                            // Mark as known-spent so we stop firing stale
-                            // bundles while RPC catches up.
-                            known_spent_coins.insert(rpc_coin_id);
-                            bundle_grid.retain(|p| p.target_coin_id != rpc_coin_id);
-                            submitted_coins.remove(&rpc_coin_id);
-                            eprintln!("Push rejected: coin already spent on-chain (rival win)");
+                            // Mark as known-spent so we fire descendants
+                            // instead on subsequent peaks.
+                            known_spent_coins.insert(fire_coin_id);
+                            bundle_grid.retain(|p| p.target_coin_id != fire_coin_id);
+                            submitted_coins.remove(&fire_coin_id);
+                            eprintln!(
+                                "Push rejected: coin {}… already spent on-chain",
+                                &hex::encode(fire_coin_id)
+                            );
                             // Eagerly check if it was actually our win.
                             if !submitted_coins.is_empty() {
                                 check_mining_results(
@@ -974,12 +987,23 @@ async fn mine_instant_react(
         }
 
         // ── Rebuild grid if depleted ─────────────────────────────
-        let usable_entries = bundle_grid
-            .iter()
-            .filter(|p| p.target_coin_id == rpc_coin_id && p.target_height >= current_height)
-            .count();
+        // When the RPC coin is known-spent, count ALL remaining entries
+        // (descendants) — don't rebuild until those are exhausted too.
+        let usable_entries = if rpc_coin_is_spent {
+            bundle_grid
+                .iter()
+                .filter(|p| p.target_height >= current_height)
+                .count()
+        } else {
+            bundle_grid
+                .iter()
+                .filter(|p| p.target_coin_id == rpc_coin_id && p.target_height >= current_height)
+                .count()
+        };
 
-        if usable_entries == 0 {
+        // Skip rebuild when RPC is stale — we'd just rebuild for the
+        // spent coin again.  Wait for a fresh coin to appear.
+        if usable_entries == 0 && !rpc_coin_is_spent {
             println!(
                 "Height {current_height}: grid empty for current coin — rebuilding"
             );
