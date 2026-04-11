@@ -587,15 +587,16 @@ async fn build_polling_bundle(
 ) -> Result<SpendBundle> {
     let _ = (full_cat_ph, epoch, reward); // used by caller for guards already
 
+    let user_height = mine_height - 1;
     println!(
-        "Grinding nonce at height {mine_height} (epoch={epoch}, reward={reward}, difficulty=2^{difficulty_bits})…"
+        "Grinding nonce at height {mine_height} (user_height={user_height}, epoch={epoch}, reward={reward}, difficulty=2^{difficulty_bits})…"
     );
     let cancel = Arc::new(AtomicBool::new(false));
     let grind_start = Instant::now();
     let nonce = find_valid_nonce(
         &inner_puzzle_hash,
         pk_bytes,
-        mine_height,
+        user_height,
         difficulty_bits,
         MAX_NONCE_ATTEMPTS,
         config.thread_count,
@@ -604,7 +605,7 @@ async fn build_polling_bundle(
     let nonce = match nonce {
         Some(n) => n,
         None => {
-            anyhow::bail!("Could not find valid nonce for height {mine_height}");
+            anyhow::bail!("Could not find valid nonce for height {mine_height} (user_height={user_height})");
         }
     };
     println!("Found nonce {nonce} in {:.2?} — building spend bundle…", grind_start.elapsed());
@@ -626,7 +627,7 @@ async fn build_polling_bundle(
     let bundle = build_mining_bundle(
         config,
         &target_cat,
-        mine_height,
+        user_height,
         nonce,
         inner_puzzle_hash,
         pk_bytes,
@@ -1119,6 +1120,7 @@ fn precompute_bundle_grid(
         if root_cat.coin.amount >= base_reward {
             for &height_offset in &HEIGHT_OFFSETS {
                 let target_height = current_height + height_offset;
+                let user_height = target_height - 1;
                 let epoch = get_epoch(target_height);
                 let diff_bits = get_difficulty_bits(epoch);
 
@@ -1127,7 +1129,7 @@ fn precompute_bundle_grid(
                 let nonce = match find_valid_nonce(
                     &inner_puzzle_hash,
                     pk_bytes,
-                    target_height,
+                    user_height,
                     diff_bits,
                     MAX_NONCE_ATTEMPTS,
                     config.thread_count,
@@ -1136,20 +1138,20 @@ fn precompute_bundle_grid(
                     Some(n) => n,
                     None => {
                         if config.debug {
-                            println!("[debug] precompute_grid: gen=0 h={target_height} — nonce not found, skipping");
+                            println!("[debug] precompute_grid: gen=0 h={target_height} user_h={user_height} — nonce not found, skipping");
                         }
                         continue;
                     }
                 };
                 println!(
-                    "Found nonce {nonce} in {:.2?} (precomputed gen=0 height={target_height})",
+                    "Found nonce {nonce} in {:.2?} (precomputed gen=0 height={target_height}, user_height={user_height})",
                     grind_start.elapsed()
                 );
 
                 let bundle = match build_mining_bundle(
                     config,
                     &root_cat,
-                    target_height,
+                    user_height,
                     nonce,
                     inner_puzzle_hash,
                     pk_bytes,
@@ -1161,14 +1163,14 @@ fn precompute_bundle_grid(
                 ) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("precompute_grid: gen=0 h={target_height} bundle build error: {e}");
+                        eprintln!("precompute_grid: gen=0 h={target_height} user_h={user_height} bundle build error: {e}");
                         continue;
                     }
                 };
 
                 let coin_id = root_cat.coin.coin_id();
                 println!(
-                    "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen=0)",
+                    "Precomputed bundle ready for height {target_height} (user_height={user_height}, nonce={nonce}, coin={}…, gen=0)",
                     &hex::encode(coin_id)
                 );
                 grid.push(PrecomputedBundle { target_height, target_coin_id: coin_id, bundle, nonce });
@@ -1211,6 +1213,7 @@ fn precompute_bundle_grid(
         for &height_offset in &HEIGHT_OFFSETS {
             // Shift by gen: gen=1 → offsets 2,3,4; gen=2 → 3,4,5; etc.
             let target_height = current_height + height_offset + gen as u32;
+            let user_height = target_height - 1;
             let epoch = get_epoch(target_height);
             let diff_bits = get_difficulty_bits(epoch);
 
@@ -1219,7 +1222,7 @@ fn precompute_bundle_grid(
             let nonce = match find_valid_nonce(
                 &inner_puzzle_hash,
                 pk_bytes,
-                target_height,
+                user_height,
                 diff_bits,
                 MAX_NONCE_ATTEMPTS,
                 config.thread_count,
@@ -1229,21 +1232,21 @@ fn precompute_bundle_grid(
                 None => {
                     if config.debug {
                         println!(
-                            "[debug] precompute_grid: gen={gen} h={target_height} — nonce not found, skipping"
+                            "[debug] precompute_grid: gen={gen} h={target_height} user_h={user_height} — nonce not found, skipping"
                         );
                     }
                     continue;
                 }
             };
             println!(
-                "Found nonce {nonce} in {:.2?} (precomputed gen={gen} height={target_height})",
+                "Found nonce {nonce} in {:.2?} (precomputed gen={gen} height={target_height}, user_height={user_height})",
                 grind_start.elapsed()
             );
 
             let bundle = match build_mining_bundle(
                 config,
                 &child_cat,
-                target_height,
+                user_height,
                 nonce,
                 inner_puzzle_hash,
                 pk_bytes,
@@ -1256,7 +1259,7 @@ fn precompute_bundle_grid(
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!(
-                        "precompute_grid: gen={gen} h={target_height} bundle build error: {e}"
+                        "precompute_grid: gen={gen} h={target_height} user_h={user_height} bundle build error: {e}"
                     );
                     continue;
                 }
@@ -1264,7 +1267,7 @@ fn precompute_bundle_grid(
 
             let coin_id = child_cat.coin.coin_id();
             println!(
-                "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen={gen})",
+                "Precomputed bundle ready for height {target_height} (user_height={user_height}, nonce={nonce}, coin={}…, gen={gen})",
                 &hex::encode(coin_id)
             );
 
