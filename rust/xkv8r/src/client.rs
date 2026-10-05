@@ -460,7 +460,7 @@ pub async fn push_tx_to_all(
                 return PushTxResult {
                     success: true,
                     status: Some(tx_res.status.clone()),
-                    error: None,
+                    error: tx_res.error.clone().filter(|e| !e.is_empty()),
                     error_category: "success",
                     per_client_errors: Vec::new(),
                 };

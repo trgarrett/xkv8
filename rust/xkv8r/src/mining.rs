@@ -206,14 +206,17 @@ type CachedBundle = Option<(Bytes32, u32, SpendBundle)>;
 ///
 /// Two retry conditions:
 /// - `coin_not_ready` (UNKNOWN_UNSPENT): the node hasn't indexed the parent coin yet.
-/// - `status == "PENDING"`: the node acknowledged receipt but the tx may be silently
-///   dropped before reaching the mempool.  Resubmitting causes the node to either
-///   confirm it properly, return mempool_conflict (already there), or re-evaluate.
+/// - `status == "PENDING"` (only when `retry_pending`): the node acknowledged receipt but
+///   the tx may be silently dropped before reaching the mempool.  Resubmitting causes the
+///   node to either confirm it properly, return mempool_conflict (already there), or
+///   re-evaluate.  The instant-react loop disables this: PENDING there is a same-coin
+///   conflict with a still-valid earlier bundle, which identical re-pushes never resolve.
 async fn push_tx_with_retry(
     clients: &[Arc<dyn RpcClient>],
     bundle: &SpendBundle,
     label: &str,
     config: &Config,
+    retry_pending: bool,
 ) -> crate::client::PushTxResult {
     let retry_secs = config.coin_not_ready_retry_secs;
     let max_retries = config.coin_not_ready_max_retries;
@@ -229,7 +232,8 @@ async fn push_tx_with_retry(
     };
 
     for attempt in 1..=max_retries {
-        let is_pending = result.success
+        let is_pending = retry_pending
+            && result.success
             && result.status.as_deref().map(|s| s.eq_ignore_ascii_case("pending")).unwrap_or(false);
         let is_not_ready = !result.success && result.error_category == "coin_not_ready";
         let is_rate_limited = !result.success && result.error_category == "rate_limit";
@@ -524,7 +528,7 @@ async fn poll_once(
         .await?
     };
 
-    let result = push_tx_with_retry(clients, &bundle, "polling", config).await;
+    let result = push_tx_with_retry(clients, &bundle, "polling", config, true).await;
     if result.success {
         submitted_coins.insert(coin_id_key, mine_height);
         // Prune stale entries
@@ -803,6 +807,7 @@ async fn mine_instant_react(
             continue;
         }
 
+        let peak_received = Instant::now();
         let peak = NewPeakWallet::from_bytes(&msg.data)?;
         let new_height = peak.height;
         if new_height == current_height {
@@ -1003,23 +1008,31 @@ async fn mine_instant_react(
                         };
 
                         println!(
-                            "NewPeak {current_height}: firing bundle (pinned={mine_height}, coin={}…{})",
+                            "NewPeak {current_height}: firing bundle (pinned={mine_height}, coin={}…{}) +{}ms since peak",
                             &hex::encode(coin_id),
-                            if gen > 0 { format!(" [descendant gen={gen}]") } else { String::new() }
+                            if gen > 0 { format!(" [descendant gen={gen}]") } else { String::new() },
+                            peak_received.elapsed().as_millis()
                         );
                         let label = format!("NewPeak h={current_height} pinned={mine_height}");
+                        let push_started = Instant::now();
                         // Descendants may not be indexed yet; don't block on retries.
                         let result = if gen > 0 {
                             push_tx_to_all(clients, &bundle).await
                         } else {
-                            push_tx_with_retry(clients, &bundle, &label, config).await
+                            push_tx_with_retry(clients, &bundle, &label, config, false).await
                         };
 
                         if result.success {
                             submitted_coins.insert(coin_id, mine_height);
+                            let detail = match &result.error {
+                                Some(e) => format!(", Detail={e:?}"),
+                                None => String::new(),
+                            };
                             println!(
-                                "Submitted mining spend for pinned height {mine_height}, Status={:?}",
-                                result.status
+                                "Submitted mining spend for pinned height {mine_height}, Status={:?}{detail} (push took {}ms, {}ms since peak)",
+                                result.status,
+                                push_started.elapsed().as_millis(),
+                                peak_received.elapsed().as_millis()
                             );
                             break;
                         }
@@ -1458,6 +1471,13 @@ async fn check_mining_results(
                                         if let Ok(conditions) =
                                             <Vec<Condition>>::from_clvm(&allocator, output)
                                         {
+                                            let winning_pinned = conditions.iter().find_map(|c| {
+                                                if let Condition::AssertHeightAbsolute(a) = c {
+                                                    Some(a.height)
+                                                } else {
+                                                    None
+                                                }
+                                            });
                                             let mut reward_mojos = 0u64;
                                             for cond in &conditions {
                                                 if let Condition::CreateCoin(cc) = cond {
@@ -1470,8 +1490,10 @@ async fn check_mining_results(
                                             if reward_mojos > 0 {
                                                 println!("{EXCAVATOR_ART}");
                                                 println!(
-                                                    "Win CONFIRMED at height {}!",
-                                                    cr.spent_block_index
+                                                    "Win CONFIRMED at height {} (winning bundle pinned={}; last submitted pinned={sub_height})!",
+                                                    cr.spent_block_index,
+                                                    winning_pinned
+                                                        .map_or("?".to_string(), |h| h.to_string())
                                                 );
                                                 let reward_cat = reward_mojos as f64 / 1000.0;
                                                 println!(
