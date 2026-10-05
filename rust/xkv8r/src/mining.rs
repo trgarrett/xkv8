@@ -766,6 +766,9 @@ async fn mine_instant_react(
     // Start with an empty grid — the first NewPeakWallet message (which
     // arrives within seconds) will trigger the initial grid build.
     let mut bundle_grid: Vec<PrecomputedBundle> = Vec::new();
+    // Consecutive peaks where grid is empty and the RPC coin is known-spent.
+    // After a threshold we force-clear known_spent so the next rebuild can fire.
+    let mut spent_stall_count: u32 = 0;
 
     println!("Instant-react mining active — waiting for NewPeakWallet events…");
     println!();
@@ -793,6 +796,40 @@ async fn mine_instant_react(
             continue;
         }
 
+        // Sanity-check: reject heights that deviate too far from what we last
+        // confirmed in either direction.  Large forward jumps wipe the grid;
+        // large backward jumps from a fraudulent peer could force us to re-mine
+        // already-confirmed heights and waste bundles on stale coins.
+        const MAX_PEAK_JUMP: u32 = 20;
+        const LOUD_PEAK_JUMP: u32 = 5;
+        if current_height > 0 {
+            if new_height > current_height + MAX_PEAK_JUMP {
+                eprintln!(
+                    "⚠️  SUSPICIOUS PEAK (forward): {new_height} vs current={current_height} (+{}) — IGNORING",
+                    new_height - current_height
+                );
+                continue;
+            }
+            if new_height < current_height.saturating_sub(MAX_PEAK_JUMP) {
+                eprintln!(
+                    "⚠️  SUSPICIOUS PEAK (backward): {new_height} vs current={current_height} (-{}) — IGNORING",
+                    current_height - new_height
+                );
+                continue;
+            }
+            if new_height > current_height + LOUD_PEAK_JUMP {
+                eprintln!(
+                    "⚠️  LARGE FORWARD JUMP: height {new_height} vs current={current_height} (+{})",
+                    new_height - current_height
+                );
+            } else if new_height < current_height.saturating_sub(LOUD_PEAK_JUMP) {
+                eprintln!(
+                    "⚠️  LARGE REORG: height {new_height} vs current={current_height} (-{})",
+                    current_height - new_height
+                );
+            }
+        }
+
         println!("NewPeak: {new_height}");
         current_height = new_height;
 
@@ -808,11 +845,9 @@ async fn mine_instant_react(
         let rpc_cat = match rpc_cat {
             Ok(Some(cat)) => cat,
             Ok(None) => {
-                if config.debug || current_height % 50 == 0 {
-                    println!(
-                        "Height {current_height}: no unspent lode coin found"
-                    );
-                }
+                println!(
+                    "Height {current_height}: no unspent lode coin found (RPC returned nothing)"
+                );
                 continue;
             }
             Err(e) => {
@@ -1018,8 +1053,27 @@ async fn mine_instant_react(
                 .count()
         };
 
-        // Skip rebuild when RPC is stale — we'd just rebuild for the
-        // spent coin again.  Wait for a fresh coin to appear.
+        // If the grid is empty but the RPC coin is known-spent, we're stalled:
+        // the RPC hasn't shown the new coin yet.  Count the stall.  After a
+        // threshold, force-clear known_spent so the next peak can trigger a
+        // fresh bootstrap and rebuild rather than staying silently stuck.
+        const SPENT_STALL_LIMIT: u32 = 5;
+        if usable_entries == 0 && rpc_coin_is_spent {
+            spent_stall_count += 1;
+            eprintln!(
+                "Height {current_height}: grid empty, RPC coin still known-spent (stall {spent_stall_count}/{SPENT_STALL_LIMIT})"
+            );
+            if spent_stall_count >= SPENT_STALL_LIMIT {
+                eprintln!(
+                    "Height {current_height}: forcing known_spent clear after {SPENT_STALL_LIMIT} stalled peaks"
+                );
+                known_spent_coins.clear();
+                spent_stall_count = 0;
+            }
+        } else {
+            spent_stall_count = 0;
+        }
+
         if usable_entries == 0 && !rpc_coin_is_spent {
             println!(
                 "Height {current_height}: grid empty for current coin — rebuilding"
