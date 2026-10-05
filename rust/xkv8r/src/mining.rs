@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chia_bls::{PublicKey, SecretKey};
 use chia_protocol::{
-    Bytes32, Coin, CoinSpend, CoinStateFilters,
+    BlockRecord, Bytes32, Coin, CoinSpend, CoinStateFilters,
     NewPeakWallet, ProtocolMessageTypes, SpendBundle,
 };
 use chia_puzzle_types::DeriveSynthetic;
@@ -375,6 +375,8 @@ async fn poll_once(
         .blockchain_state
         .context("No blockchain_state in response")?;
     let height = state.peak.height;
+    // Timelocks are evaluated against the last transaction block, not the peak.
+    let last_tx = last_tx_height(&state.peak);
 
     let new_height = height as i64 != *last_height;
     if new_height {
@@ -443,7 +445,7 @@ async fn poll_once(
         );
     }
 
-    let mine_height = height;
+    let mine_height = last_tx;
     if mine_height < GENESIS_HEIGHT {
         println!(
             "Waiting for genesis. {} blocks to go!",
@@ -465,13 +467,19 @@ async fn poll_once(
 
     let coin_id_key = largest_cr.coin.coin_id();
 
-    // Skip entirely if already submitted for this coin
-    if submitted_coins.contains_key(&coin_id_key) {
+    // Skip if already submitted for this coin at the current pinned height;
+    // a new transaction block changes the pinned height and needs a fresh spend.
+    if submitted_coins.get(&coin_id_key) == Some(&mine_height) {
         if config.debug {
             println!(
                 "[debug] Skipping resubmit for coin already submitted at height {mine_height}"
             );
         }
+        return Ok(());
+    }
+
+    // ASSERT_HEIGHT_RELATIVE 1: the coin must be older than the last tx block.
+    if largest_cr.confirmed_block_index >= mine_height {
         return Ok(());
     }
 
@@ -520,7 +528,7 @@ async fn poll_once(
     if result.success {
         submitted_coins.insert(coin_id_key, mine_height);
         // Prune stale entries
-        submitted_coins.retain(|_, v| mine_height < *v + 3);
+        submitted_coins.retain(|_, v| height < *v + 10);
         println!(
             "Submitted mining spend bundle for height {mine_height}, Status={:?}",
             result.status
@@ -646,8 +654,8 @@ async fn build_polling_bundle(
 // ── Instant-react mining (LOCAL_FULL_NODE only) ────────────────────────
 //
 // Driven entirely by NewPeakWallet events.  On each new peak we fetch the
-// current unspent lode coin via RPC, invalidate stale grid entries, fire
-// the best precomputed bundle, and rebuild the grid when it is depleted.
+// current unspent lode coin via RPC, pin a spend to the last transaction
+// block height, and fire it (nonces are cached/pre-ground per height).
 
 #[allow(clippy::too_many_arguments)]
 async fn mine_instant_react(
@@ -694,9 +702,10 @@ async fn mine_instant_react(
     println!("Peer connected to {socket_addr}");
 
     // Bootstrap initial Cat from RPC
-    let initial_cat =
-        bootstrap_cat_from_rpc(clients, full_cat_ph, inner_puzzle_hash, height).await?;
-    let initial_cat = initial_cat.context("Failed to bootstrap initial Cat object")?;
+    let (initial_cat, _) =
+        bootstrap_cat_from_rpc(clients, full_cat_ph, inner_puzzle_hash, height)
+            .await?
+            .context("Failed to bootstrap initial Cat object")?;
     println!(
         "Bootstrapped Cat: coin_id={}…, amount={}",
         &hex::encode(initial_cat.coin.coin_id()),
@@ -704,7 +713,7 @@ async fn mine_instant_react(
     );
 
     let mut submitted_coins: SubmittedCoins = HashMap::new();
-    let mut current_cat: Option<Cat> = Some(initial_cat);
+    let mut current_coin_id: Option<Bytes32> = Some(initial_cat.coin.coin_id());
     let mut current_height = height;
 
     // Coins we know are spent on-chain (confirmed via "already_spent" push
@@ -763,12 +772,16 @@ async fn mine_instant_react(
         }
     }
 
-    // Start with an empty grid — the first NewPeakWallet message (which
-    // arrives within seconds) will trigger the initial grid build.
-    let mut bundle_grid: Vec<PrecomputedBundle> = Vec::new();
-    // Consecutive peaks where grid is empty and the RPC coin is known-spent.
-    // After a threshold we force-clear known_spent so the next rebuild can fire.
-    let mut spent_stall_count: u32 = 0;
+    // Speculative grid of fully built and signed bundles keyed by
+    // (lode coin, pinned height), covering the current coin and its next three
+    // descendants across the upcoming transaction-block heights.  Firing is a
+    // lookup; a miss falls back to building on demand.  Nonces depend only on
+    // the pinned height so they are cached separately.  The grid is dropped
+    // whenever the fee coin set changes, since bundles embed fee coins.
+    let mut nonce_cache: HashMap<u32, u64> = HashMap::new();
+    let mut bundle_grid: HashMap<(Bytes32, u32), SpendBundle> = HashMap::new();
+    let mut cache_fee_ids: Vec<Bytes32> = fee_coins.iter().map(|c| c.coin_id()).collect();
+    cache_fee_ids.sort();
 
     println!("Instant-react mining active — waiting for NewPeakWallet events…");
     println!();
@@ -797,9 +810,8 @@ async fn mine_instant_react(
         }
 
         // Sanity-check: reject heights that deviate too far from what we last
-        // confirmed in either direction.  Large forward jumps wipe the grid;
-        // large backward jumps from a fraudulent peer could force us to re-mine
-        // already-confirmed heights and waste bundles on stale coins.
+        // confirmed in either direction, so a fraudulent peer cannot make us
+        // act on bogus chain state.
         const MAX_PEAK_JUMP: u32 = 20;
         const LOUD_PEAK_JUMP: u32 = 5;
         if current_height > 0 {
@@ -834,16 +846,15 @@ async fn mine_instant_react(
         current_height = new_height;
 
         // ── Fetch current unspent lode coin via RPC ──────────────
-        let rpc_cat = bootstrap_cat_from_rpc(
+        let (rpc_cat, rpc_confirmed) = match bootstrap_cat_from_rpc(
             clients,
             full_cat_ph,
             inner_puzzle_hash,
             current_height,
         )
-        .await;
-
-        let rpc_cat = match rpc_cat {
-            Ok(Some(cat)) => cat,
+        .await
+        {
+            Ok(Some(found)) => found,
             Ok(None) => {
                 println!(
                     "Height {current_height}: no unspent lode coin found (RPC returned nothing)"
@@ -857,21 +868,13 @@ async fn mine_instant_react(
         };
 
         let rpc_coin_id = rpc_cat.coin.coin_id();
-        let prev_coin_id = current_cat.as_ref().map(|c| c.coin.coin_id());
-        let coin_changed = prev_coin_id.map_or(true, |prev| prev != rpc_coin_id);
-
-        if coin_changed {
+        if current_coin_id != Some(rpc_coin_id) {
             println!(
                 "Lode coin changed at height {current_height}: coin_id={}…, amount={}",
                 &hex::encode(rpc_coin_id),
                 rpc_cat.coin.amount
             );
-
-            // RPC finally shows a new coin — clear known-spent tracking
-            // for old coins since they are no longer relevant.
             known_spent_coins.clear();
-
-            // Check if any of our submitted coins were confirmed
             if !submitted_coins.is_empty() {
                 check_mining_results(
                     clients[0].as_ref(),
@@ -882,476 +885,361 @@ async fn mine_instant_react(
                 )
                 .await;
             }
-
-            // Discard grid entries for ancestors (any coin_id that isn't
-            // the new coin or its descendants).  Since the coin changed,
-            // all entries targeting the old coin are stale.
-            let before = bundle_grid.len();
-            bundle_grid.retain(|p| p.target_coin_id == rpc_coin_id);
-            let discarded = before - bundle_grid.len();
-            if discarded > 0 && config.debug {
-                println!(
-                    "[debug] Discarded {discarded} grid entries for old coin(s) ({} remain)",
-                    bundle_grid.len()
-                );
-            }
-
-            current_cat = Some(rpc_cat.clone());
+            current_coin_id = Some(rpc_coin_id);
         }
 
-        let rpc_coin_is_spent = known_spent_coins.contains(&rpc_coin_id);
-
-        // Prune grid entries whose target_height is below the current height
-        // (they can no longer land in a valid block).
-        let before = bundle_grid.len();
-        bundle_grid.retain(|p| p.target_height >= current_height);
-        let pruned = before - bundle_grid.len();
-        if pruned > 0 && config.debug {
-            println!(
-                "[debug] Pruned {pruned} expired grid entries ({} remain)",
-                bundle_grid.len()
-            );
-        }
-
-        // Refresh fee coins via RPC
+        // Refresh fee coins; a changed set invalidates every cached bundle.
         if config.fee_mojos > 0 {
             fee_coins = fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
+            let mut ids: Vec<Bytes32> = fee_coins.iter().map(|c| c.coin_id()).collect();
+            ids.sort();
+            if ids != cache_fee_ids {
+                bundle_grid.clear();
+                cache_fee_ids = ids;
+            }
         }
 
-        // ── Fire best precomputed bundle ─────────────────────────
-        // Always fire on every NewPeak, even if we previously submitted
-        // for this coin.  This ensures our target height stays fresh —
-        // if the chain advances past our previous target, the old spend
-        // ages out of the mempool and we need a replacement immediately.
-        //
-        // When the RPC coin is known-spent, we fire the best DESCENDANT
-        // entry from the grid (gen=1+) instead — these target child coins
-        // that should appear once the on-chain spend confirms.
-        {
-            let best = if rpc_coin_is_spent {
-                // RPC is stale — fire best descendant entry (any coin_id
-                // that isn't the spent one).
-                bundle_grid
-                    .iter()
-                    .filter(|p| {
-                        p.target_coin_id != rpc_coin_id
-                            && p.target_height >= current_height
-                            && p.target_height <= current_height + 2
-                    })
-                    .min_by_key(|p| p.target_height)
-                    .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
-            } else {
-                // Normal path — fire entry matching the current RPC coin.
-                bundle_grid
-                    .iter()
-                    .filter(|p| {
-                        p.target_coin_id == rpc_coin_id
-                            && p.target_height >= current_height
-                            && p.target_height <= current_height + 2
-                    })
-                    .min_by_key(|p| p.target_height)
-                    .map(|p| (p.bundle.clone(), p.target_height, p.nonce, p.target_coin_id))
-            };
+        // Chia checks ASSERT_HEIGHT_* against the last *transaction block*
+        // height, not the peak.  Pinning the spend to that height keeps it
+        // valid for the next transaction block (window is [U, U+2]).
+        let Some(mine_height) = fetch_last_tx_height(clients).await else {
+            eprintln!("Height {current_height}: could not read last transaction block height");
+            continue;
+        };
+        if mine_height <= GENESIS_HEIGHT {
+            continue;
+        }
+        let epoch = get_epoch(mine_height);
+        let reward = get_reward(epoch);
+        let diff_bits = get_difficulty_bits(epoch);
 
-            if let Some((bundle, target_height, nonce, fire_coin_id)) = best {
-                println!(
-                    "NewPeak {current_height}: firing precomputed bundle (target_height={target_height}, nonce={nonce}, coin={}…{})",
-                    &hex::encode(fire_coin_id),
-                    if rpc_coin_is_spent { " [descendant]" } else { "" }
+        // First lode coin in [rpc coin, child, grandchild, great-grandchild]
+        // not known to be spent.  Descendants are only reached when the RPC
+        // lags the chain.
+        let mut candidate: Option<(Cat, usize)> = None;
+        {
+            let mut cand = rpc_cat.clone();
+            for gen in 0..=3usize {
+                if !known_spent_coins.contains(&cand.coin.coin_id()) {
+                    candidate = Some((cand, gen));
+                    break;
+                }
+                if cand.coin.amount < reward {
+                    break;
+                }
+                cand = cand.child(inner_puzzle_hash, cand.coin.amount - reward);
+            }
+        }
+
+        match candidate {
+            None => {
+                eprintln!(
+                    "Height {current_height}: all tracked lode coins known-spent — clearing and re-reading from RPC"
                 );
-                let label = format!("NewPeak h={current_height} target={target_height}");
-                // For descendant coins (parent known-spent), the child may
-                // not be indexed yet.  Use a single attempt without retries
-                // to avoid blocking on UNKNOWN_UNSPENT — the next NewPeak
-                // will try again once the node has caught up.
-                let result = if rpc_coin_is_spent {
-                    push_tx_to_all(clients, &bundle).await
-                } else {
-                    push_tx_with_retry(clients, &bundle, &label, config).await
-                };
-                if result.success {
-                    // Track for win/loss detection, but do NOT mark as
-                    // known-spent or purge grid — we keep firing fresh
-                    // heights on each subsequent peak so our spend never
-                    // ages out of the mempool.
-                    submitted_coins.insert(fire_coin_id, target_height);
+                known_spent_coins.clear();
+            }
+            Some((cat, gen)) => {
+                let coin_id = cat.coin.coin_id();
+                // ASSERT_HEIGHT_RELATIVE 1: the coin must be older than the
+                // last transaction block, otherwise the spend can only sit pending.
+                let too_young = gen == 0 && rpc_confirmed >= mine_height;
+                if cat.coin.amount < reward {
                     println!(
-                        "Submitted mining spend for height {target_height}, Status={:?}",
-                        result.status
+                        "Lode coin amount ({}) less than reward ({reward}), skipping",
+                        cat.coin.amount
                     );
+                } else if too_young {
+                    if config.debug {
+                        println!(
+                            "[debug] Coin confirmed at {rpc_confirmed} is not yet spendable at last tx block {mine_height}"
+                        );
+                    }
+                } else if submitted_coins.get(&coin_id) == Some(&mine_height) {
+                    if config.debug {
+                        println!("[debug] Already submitted coin for pinned height {mine_height}");
+                    }
                 } else {
-                    match result.error_category {
-                        "already_spent" => {
-                            // Coin confirmed-spent on-chain (our win or rival).
-                            // Mark as known-spent so we fire descendants
-                            // instead on subsequent peaks.
-                            known_spent_coins.insert(fire_coin_id);
-                            bundle_grid.retain(|p| p.target_coin_id != fire_coin_id);
-                            submitted_coins.remove(&fire_coin_id);
-                            eprintln!(
-                                "Push rejected: coin {}… already spent on-chain",
-                                &hex::encode(fire_coin_id)
-                            );
-                            // Eagerly check if it was actually our win.
-                            if !submitted_coins.is_empty() {
-                                check_mining_results(
-                                    clients[0].as_ref(),
+                    for attempt in 0..2 {
+                        let key = (coin_id, mine_height);
+                        let bundle = match bundle_grid.get(&key) {
+                            Some(b) => b.clone(),
+                            None => {
+                                let Some(nonce) = get_nonce(
+                                    &mut nonce_cache,
+                                    config,
                                     inner_puzzle_hash,
-                                    &mut submitted_coins,
-                                    &config.target_puzzlehash,
-                                    &config.target_address,
+                                    pk_bytes,
+                                    mine_height,
+                                    diff_bits,
                                 )
-                                .await;
+                                .await
+                                else {
+                                    eprintln!("Could not find nonce for height {mine_height}");
+                                    break;
+                                };
+                                match build_mining_bundle(
+                                    config,
+                                    &cat,
+                                    mine_height,
+                                    nonce,
+                                    inner_puzzle_hash,
+                                    pk_bytes,
+                                    sk,
+                                    &fee_coins,
+                                    fee_puzzlehash,
+                                    synthetic_sk,
+                                    synthetic_pk,
+                                ) {
+                                    Ok(b) => {
+                                        bundle_grid.insert(key, b.clone());
+                                        b
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Bundle build error at height {mine_height}: {e}");
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        "mempool_conflict" => {
-                            // Our own or a rival spend is already in the
-                            // mempool.  Keep firing on subsequent peaks —
-                            // the existing entry may age out.
-                            if config.debug {
-                                println!(
-                                    "[debug] Mempool conflict at height {current_height} — will retry next peak"
-                                );
-                            }
-                        }
-                        "transport" => {
-                            eprintln!(
-                                "Transport error pushing bundle (will retry next block): {:?}",
-                                result.error
+                        };
+
+                        println!(
+                            "NewPeak {current_height}: firing bundle (pinned={mine_height}, coin={}…{})",
+                            &hex::encode(coin_id),
+                            if gen > 0 { format!(" [descendant gen={gen}]") } else { String::new() }
+                        );
+                        let label = format!("NewPeak h={current_height} pinned={mine_height}");
+                        // Descendants may not be indexed yet; don't block on retries.
+                        let result = if gen > 0 {
+                            push_tx_to_all(clients, &bundle).await
+                        } else {
+                            push_tx_with_retry(clients, &bundle, &label, config).await
+                        };
+
+                        if result.success {
+                            submitted_coins.insert(coin_id, mine_height);
+                            println!(
+                                "Submitted mining spend for pinned height {mine_height}, Status={:?}",
+                                result.status
                             );
-                            for (i, summary) in &result.per_client_errors {
-                                eprintln!("  client[{i}]: {summary}");
-                            }
+                            break;
                         }
-                        "coin_not_ready" => {
-                            // Child coin not indexed yet — expected for
-                            // descendants.  Will retry on next NewPeak.
-                            if config.debug {
-                                println!(
-                                    "[debug] Coin not ready (UNKNOWN_UNSPENT) — will retry next peak"
+
+                        match result.error_category {
+                            "already_spent" => {
+                                // DOUBLE_SPEND can name any input, including a
+                                // fee coin.  Only trust it for the lode coin
+                                // after confirming against chain state.
+                                if coin_spent_on_chain(clients, coin_id).await {
+                                    known_spent_coins.insert(coin_id);
+                                    bundle_grid.retain(|(c, _), _| *c != coin_id);
+                                    eprintln!(
+                                        "Push rejected: lode coin {}… already spent on-chain",
+                                        &hex::encode(coin_id)
+                                    );
+                                    if !submitted_coins.is_empty() {
+                                        check_mining_results(
+                                            clients[0].as_ref(),
+                                            inner_puzzle_hash,
+                                            &mut submitted_coins,
+                                            &config.target_puzzlehash,
+                                            &config.target_address,
+                                        )
+                                        .await;
+                                    }
+                                    break;
+                                }
+                                eprintln!(
+                                    "Push got DOUBLE_SPEND but lode coin {}… is unspent — a bundled fee coin is stale: {:?}",
+                                    &hex::encode(coin_id),
+                                    result.error
                                 );
+                                bundle_grid.clear();
+                                if config.fee_mojos > 0 && attempt == 0 {
+                                    fee_coins =
+                                        fetch_fee_coins(clients, fee_puzzlehash, current_height).await;
+                                    let mut ids: Vec<Bytes32> =
+                                        fee_coins.iter().map(|c| c.coin_id()).collect();
+                                    ids.sort();
+                                    if ids != cache_fee_ids {
+                                        cache_fee_ids = ids;
+                                        continue; // retry once with fresh fee coins
+                                    }
+                                }
                             }
+                            "mempool_conflict" => {
+                                if config.debug {
+                                    println!(
+                                        "[debug] Mempool conflict at height {current_height} — will retry next peak"
+                                    );
+                                }
+                            }
+                            "transport" => {
+                                eprintln!(
+                                    "Transport error pushing bundle (will retry next block): {:?}",
+                                    result.error
+                                );
+                                for (i, summary) in &result.per_client_errors {
+                                    eprintln!("  client[{i}]: {summary}");
+                                }
+                            }
+                            "coin_not_ready" => {
+                                if config.debug {
+                                    println!(
+                                        "[debug] Coin not ready (UNKNOWN_UNSPENT) — will retry next peak"
+                                    );
+                                }
+                            }
+                            cat => eprintln!("Push failed: {:?} [{cat}]", result.error),
                         }
-                        cat => eprintln!("Push failed: {:?} [{cat}]", result.error),
+                        break;
                     }
                 }
             }
         }
 
-        // ── Rebuild grid if depleted ─────────────────────────────
-        // When the RPC coin is known-spent, count ALL remaining entries
-        // (descendants) — don't rebuild until those are exhausted too.
-        let usable_entries = if rpc_coin_is_spent {
-            bundle_grid
-                .iter()
-                .filter(|p| p.target_height >= current_height)
-                .count()
-        } else {
-            bundle_grid
-                .iter()
-                .filter(|p| p.target_coin_id == rpc_coin_id && p.target_height >= current_height)
-                .count()
-        };
-
-        // If the grid is empty but the RPC coin is known-spent, we're stalled:
-        // the RPC hasn't shown the new coin yet.  Count the stall.  After a
-        // threshold, force-clear known_spent so the next peak can trigger a
-        // fresh bootstrap and rebuild rather than staying silently stuck.
-        const SPENT_STALL_LIMIT: u32 = 5;
-        if usable_entries == 0 && rpc_coin_is_spent {
-            spent_stall_count += 1;
-            eprintln!(
-                "Height {current_height}: grid empty, RPC coin still known-spent (stall {spent_stall_count}/{SPENT_STALL_LIMIT})"
-            );
-            if spent_stall_count >= SPENT_STALL_LIMIT {
-                eprintln!(
-                    "Height {current_height}: forcing known_spent clear after {SPENT_STALL_LIMIT} stalled peaks"
-                );
-                known_spent_coins.clear();
-                spent_stall_count = 0;
+        // ── Top up the speculative grid ──────────────────────────
+        // The next transaction block lands 1–7 blocks ahead, and its pinned
+        // height is that block's own height, so cover mine_height..=+7 for the
+        // root coin and each descendant (gen=N exists once N ancestors are spent).
+        let mut chain: Vec<Cat> = Vec::with_capacity(4);
+        {
+            let mut cand = rpc_cat.clone();
+            for gen in 0..=3u32 {
+                chain.push(cand.clone());
+                let r = get_reward(get_epoch(mine_height + gen));
+                if cand.coin.amount < r {
+                    break;
+                }
+                cand = cand.child(inner_puzzle_hash, cand.coin.amount - r);
             }
-        } else {
-            spent_stall_count = 0;
         }
-
-        if usable_entries == 0 && !rpc_coin_is_spent {
-            println!(
-                "Height {current_height}: grid empty for current coin — rebuilding"
-            );
-            let cfg = config.clone();
-            let cat = current_cat.clone();
-            let iph = inner_puzzle_hash;
-            let pkb = *pk_bytes;
-            let sk2 = sk.clone();
-            let fph = fee_puzzlehash;
-            let ssk = synthetic_sk.clone();
-            let spk = *synthetic_pk;
-            let fc = fee_coins.clone();
-            let ch = current_height;
-            bundle_grid = tokio::task::spawn_blocking(move || {
-                precompute_bundle_grid(
-                    &cfg, &cat, ch, iph, &pkb, &sk2, fph, &ssk, &spk, &fc,
-                )
-            })
-            .await?;
-        }
-
-        // Prune stale submitted coins
-        submitted_coins.retain(|_, v| current_height < *v + 5);
-    }
-}
-
-// ── Precomputed bundle grid ────────────────────────────────────────────
-//
-// We speculatively build a 4 (coin generations) × 5 (mine heights) grid
-// with gen-shifting applied.
-// Rows  : root, child, grandchild, great-grandchild of the current lode coin.
-// Cols  : current_height + offset (shifted by generation).
-//
-// This covers the most common race conditions:
-//   • The chain advances a block or two before our update arrives.
-//   • The lode coin we track turns out to be a grandparent of what the chain
-//     actually confirmed (because another miner fired first).
-
-struct PrecomputedBundle {
-    target_height: u32,
-    target_coin_id: Bytes32,
-    bundle: SpendBundle,
-    nonce: u64,
-}
-
-/// Build a 4×5 grid of precomputed spend bundles (gen-shifted).
-///
-/// Rows  (coin axis) : root → child → grandchild → great-grandchild of `current_cat`.
-/// Cols  (height axis): current_height + offset (shifted by gen so gen=N starts at +N+1).
-///
-/// Each cell is independent: a different nonce is ground for every
-/// (coin_id, mine_height) pair so that whichever combination the chain
-/// actually presents can be pushed immediately.
-///
-/// Entries that cannot be built (e.g. insufficient amount, nonce not found)
-/// are silently skipped — the returned `Vec` may have fewer than 20 entries.
-#[allow(clippy::too_many_arguments)]
-fn precompute_bundle_grid(
-    config: &Config,
-    current_cat: &Option<Cat>,
-    current_height: u32,
-    inner_puzzle_hash: Bytes32,
-    pk_bytes: &[u8; 48],
-    sk: &SecretKey,
-    fee_puzzlehash: Bytes32,
-    synthetic_sk: &SecretKey,
-    synthetic_pk: &PublicKey,
-    fee_coins: &[Coin],
-) -> Vec<PrecomputedBundle> {
-    const COIN_GENERATIONS: usize = 3;
-    // 5 height offsets per generation.  With the gen-shift (gen=N adds +N),
-    // the effective ranges are:
-    //   gen=0: current_height + 1..5    (root coin, immediate)
-    //   gen=1: current_height + 2..6    (child, ~3-6 blocks to appear)
-    //   gen=2: current_height + 3..7    (grandchild)
-    //   gen=3: current_height + 4..8    (great-grandchild)
-    // Each nonce grind takes ~5-50ms, so 4×5 = 20 entries ≈ 0.4s total.
-    const HEIGHT_OFFSETS: [u32; 5] = [1, 2, 3, 4, 5];
-
-    let root_cat = match current_cat.as_ref() {
-        Some(c) => c.clone(),
-        None => return Vec::new(),
-    };
-
-    // Total entries: (COIN_GENERATIONS + 1) coins × HEIGHT_OFFSETS heights.
-    // gen=0: spend root_cat itself (sole-miner first move).
-    // gen=1..=COIN_GENERATIONS: spend child, grandchild, great-grandchild
-    //   (used when another miner or a prior spend has already created the child).
-    let mut grid: Vec<PrecomputedBundle> =
-        Vec::with_capacity((COIN_GENERATIONS + 1) * HEIGHT_OFFSETS.len());
-
-    // --- gen=0: spend root_cat (the current unspent lode coin) ----------
-    {
-        let base_epoch = get_epoch(current_height);
-        let base_reward = get_reward(base_epoch);
-        if root_cat.coin.amount >= base_reward {
-            for &height_offset in &HEIGHT_OFFSETS {
-                let target_height = current_height + height_offset;
-                let epoch = get_epoch(target_height);
-                let diff_bits = get_difficulty_bits(epoch);
-
-                let cancel = Arc::new(AtomicBool::new(false));
-                let grind_start = Instant::now();
-                let nonce = match find_valid_nonce(
-                    &inner_puzzle_hash,
-                    pk_bytes,
-                    target_height,
-                    diff_bits,
-                    MAX_NONCE_ATTEMPTS,
-                    config.thread_count,
-                    cancel,
-                ) {
-                    Some(n) => n,
-                    None => {
-                        if config.debug {
-                            println!("[debug] precompute_grid: gen=0 h={target_height} — nonce not found, skipping");
-                        }
-                        continue;
-                    }
-                };
-                println!(
-                    "Found nonce {nonce} in {:.2?} (precomputed gen=0 height={target_height})",
-                    grind_start.elapsed()
-                );
-
-                let bundle = match build_mining_bundle(
+        let chain_ids: HashSet<Bytes32> = chain.iter().map(|c| c.coin.coin_id()).collect();
+        bundle_grid.retain(|(c, h), _| chain_ids.contains(c) && *h + 10 >= current_height);
+        let mut built = 0usize;
+        for h in mine_height..=(mine_height + 7) {
+            let missing: Vec<&Cat> = chain
+                .iter()
+                .enumerate()
+                .filter(|(gen, cat)| {
+                    // The root coin can never be spent at a pinned height at or
+                    // below its confirmation height.
+                    (*gen > 0 || h > rpc_confirmed)
+                        && !bundle_grid.contains_key(&(cat.coin.coin_id(), h))
+                })
+                .map(|(_, cat)| cat)
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let Some(nonce) = get_nonce(
+                &mut nonce_cache,
+                config,
+                inner_puzzle_hash,
+                pk_bytes,
+                h,
+                get_difficulty_bits(get_epoch(h)),
+            )
+            .await
+            else {
+                continue;
+            };
+            for cat in missing {
+                match build_mining_bundle(
                     config,
-                    &root_cat,
-                    target_height,
+                    cat,
+                    h,
                     nonce,
                     inner_puzzle_hash,
                     pk_bytes,
                     sk,
-                    fee_coins,
+                    &fee_coins,
                     fee_puzzlehash,
                     synthetic_sk,
                     synthetic_pk,
                 ) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("precompute_grid: gen=0 h={target_height} bundle build error: {e}");
-                        continue;
+                    Ok(b) => {
+                        bundle_grid.insert((cat.coin.coin_id(), h), b);
+                        built += 1;
                     }
-                };
-
-                let coin_id = root_cat.coin.coin_id();
-                println!(
-                    "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen=0)",
-                    &hex::encode(coin_id)
-                );
-                grid.push(PrecomputedBundle { target_height, target_coin_id: coin_id, bundle, nonce });
-            }
-        } else if config.debug {
-            println!(
-                "[debug] precompute_grid: gen=0 root coin amount ({}) < reward ({}), skipping root row",
-                root_cat.coin.amount, base_reward
-            );
-        }
-    }
-
-    // --- gen=1..=COIN_GENERATIONS: spend child/grandchild/great-grandchild --
-    //
-    // A gen=N coin cannot exist on-chain until at least N blocks after
-    // current_height (each ancestor must be spent in a separate block).
-    // Therefore the earliest valid mine height for gen=N is
-    // current_height + N + 1.  We shift the height offsets accordingly
-    // so the grid covers heights that are actually reachable when the
-    // CoinStateUpdate for the gen=N coin arrives.
-    let mut ancestor = root_cat.clone();
-    for gen in 1..=COIN_GENERATIONS {
-        // Reward at the height the ANCESTOR is expected to be spent.
-        let base_epoch = get_epoch(current_height + (gen as u32 - 1));
-        let base_reward = get_reward(base_epoch);
-
-        if ancestor.coin.amount < base_reward {
-            if config.debug {
-                println!(
-                    "[debug] precompute_grid: gen={gen} coin amount ({}) < reward ({base_reward}), stopping lineage walk",
-                    ancestor.coin.amount
-                );
-            }
-            break;
-        }
-
-        let child_amount = ancestor.coin.amount - base_reward;
-        let child_cat = ancestor.child(inner_puzzle_hash, child_amount);
-
-        for &height_offset in &HEIGHT_OFFSETS {
-            // Shift by gen: gen=1 → offsets 2,3,4; gen=2 → 3,4,5; etc.
-            let target_height = current_height + height_offset + gen as u32;
-            let epoch = get_epoch(target_height);
-            let diff_bits = get_difficulty_bits(epoch);
-
-            let cancel = Arc::new(AtomicBool::new(false));
-            let grind_start = Instant::now();
-            let nonce = match find_valid_nonce(
-                &inner_puzzle_hash,
-                pk_bytes,
-                target_height,
-                diff_bits,
-                MAX_NONCE_ATTEMPTS,
-                config.thread_count,
-                cancel,
-            ) {
-                Some(n) => n,
-                None => {
-                    if config.debug {
-                        println!(
-                            "[debug] precompute_grid: gen={gen} h={target_height} — nonce not found, skipping"
-                        );
-                    }
-                    continue;
+                    Err(e) => eprintln!("Grid build error at height {h}: {e}"),
                 }
-            };
-            println!(
-                "Found nonce {nonce} in {:.2?} (precomputed gen={gen} height={target_height})",
-                grind_start.elapsed()
-            );
-
-            let bundle = match build_mining_bundle(
-                config,
-                &child_cat,
-                target_height,
-                nonce,
-                inner_puzzle_hash,
-                pk_bytes,
-                sk,
-                fee_coins,
-                fee_puzzlehash,
-                synthetic_sk,
-                synthetic_pk,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "precompute_grid: gen={gen} h={target_height} bundle build error: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            let coin_id = child_cat.coin.coin_id();
-            println!(
-                "Precomputed bundle ready for height {target_height} (nonce={nonce}, coin={}…, gen={gen})",
-                &hex::encode(coin_id)
-            );
-
-            grid.push(PrecomputedBundle {
-                target_height,
-                target_coin_id: coin_id,
-                bundle,
-                nonce,
-            });
+            }
         }
-
-        // Advance: the child becomes the new ancestor for the next generation.
-        // Use child_amount as the surviving amount after spending.
-        ancestor = child_cat;
+        if built > 0 && config.debug {
+            println!("[debug] Grid top-up: +{built} bundles ({} total)", bundle_grid.len());
+        }
+        nonce_cache.retain(|h, _| *h + 10 >= current_height);
+        submitted_coins.retain(|_, v| current_height < *v + 10);
     }
+}
 
-    println!(
-        "Bundle grid ready: {} entries ({} coin generations × {} heights, gen-shifted)",
-        grid.len(),
-        1 + COIN_GENERATIONS,
-        HEIGHT_OFFSETS.len(),
-    );
+/// Grind (or fetch from cache) the nonce for a pinned height.
+async fn get_nonce(
+    cache: &mut HashMap<u32, u64>,
+    config: &Config,
+    inner_puzzle_hash: Bytes32,
+    pk_bytes: &[u8; 48],
+    height: u32,
+    difficulty_bits: u32,
+) -> Option<u64> {
+    if let Some(n) = cache.get(&height) {
+        return Some(*n);
+    }
+    let pkb = *pk_bytes;
+    let threads = config.thread_count;
+    let start = Instant::now();
+    let nonce = tokio::task::spawn_blocking(move || {
+        find_valid_nonce(
+            &inner_puzzle_hash,
+            &pkb,
+            height,
+            difficulty_bits,
+            MAX_NONCE_ATTEMPTS,
+            threads,
+            Arc::new(AtomicBool::new(false)),
+        )
+    })
+    .await
+    .ok()
+    .flatten()?;
     if config.debug {
-        for entry in &grid {
-            println!(
-                "[debug]   grid entry: coin={}… height={} nonce={}",
-                &hex::encode(entry.target_coin_id),
-                entry.target_height,
-                entry.nonce,
-            );
+        println!("[debug] Found nonce {nonce} for height {height} in {:.2?}", start.elapsed());
+    }
+    cache.insert(height, nonce);
+    Some(nonce)
+}
+
+/// Height of the last transaction block as of `peak`.  Chia evaluates height
+/// timelocks against this value rather than the peak height.
+fn last_tx_height(peak: &BlockRecord) -> u32 {
+    if peak.timestamp.is_some() {
+        peak.height
+    } else {
+        peak.prev_transaction_block_height
+    }
+}
+
+async fn fetch_last_tx_height(clients: &[Arc<dyn RpcClient>]) -> Option<u32> {
+    for c in clients {
+        if let Ok(res) = c.get_blockchain_state().await {
+            if let (true, Some(state)) = (res.success, res.blockchain_state) {
+                return Some(last_tx_height(&state.peak));
+            }
         }
     }
-    grid
+    None
+}
+
+/// True only if some client positively reports the coin as spent.
+async fn coin_spent_on_chain(clients: &[Arc<dyn RpcClient>], coin_id: Bytes32) -> bool {
+    for c in clients {
+        if let Ok(res) = c.get_coin_record_by_name(coin_id).await {
+            if let (true, Some(cr)) = (res.success, res.coin_record) {
+                return cr.spent;
+            }
+        }
+    }
+    false
 }
 
 // ── Cat bootstrap helpers ──────────────────────────────────────────────
@@ -1406,7 +1294,7 @@ async fn bootstrap_cat_from_rpc(
     full_cat_ph: Bytes32,
     inner_puzzle_hash: Bytes32,
     height: u32,
-) -> Result<Option<Cat>> {
+) -> Result<Option<(Cat, u32)>> {
     let mut records = None;
     for c in clients {
         match c
@@ -1438,7 +1326,9 @@ async fn bootstrap_cat_from_rpc(
         .collect();
     let cr = viable.iter().max_by_key(|r| r.confirmed_block_index).unwrap();
 
-    bootstrap_cat_from_coin(clients, &cr.coin, inner_puzzle_hash).await
+    Ok(bootstrap_cat_from_coin(clients, &cr.coin, inner_puzzle_hash)
+        .await?
+        .map(|cat| (cat, cr.confirmed_block_index)))
 }
 
 /// Parse child CATs from a parent coin spend.
